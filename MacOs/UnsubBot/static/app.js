@@ -82,21 +82,22 @@ async function initAccounts() {
 
 function updateMailboxFolders(acc) {
   if (!acc || !acc.folders || acc.folders.length === 0) return;
-  const currentVal = mailboxSelect.value;
   mailboxSelect.innerHTML = '';
+
+  // Add Full Mailbox option first
+  const fullOpt = document.createElement('option');
+  fullOpt.value = '__all__';
+  fullOpt.textContent = '⚡ Full Mailbox (All Folders)';
+  mailboxSelect.appendChild(fullOpt);
+
   acc.folders.forEach(f => {
     const opt = document.createElement('option');
     opt.value = f;
     opt.textContent = f;
     mailboxSelect.appendChild(opt);
   });
-  // Try to preserve inbox
-  const hasInbox = acc.folders.some(f => f.toLowerCase() === 'inbox');
-  if (hasInbox) {
-    mailboxSelect.value = acc.folders.find(f => f.toLowerCase() === 'inbox');
-  } else if (acc.folders.length > 0) {
-    mailboxSelect.value = acc.folders[0];
-  }
+
+  mailboxSelect.value = '__all__';
 }
 
 accountSelect.addEventListener('change', () => {

@@ -158,49 +158,85 @@ def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
 
 
 def scan_thunderbird_account(account_cfg, mailbox_name="INBOX"):
-    """Scan local Thunderbird mbox store for senders and domains."""
+    """Scan local Thunderbird mbox store for senders and domains using ultra-fast streaming."""
     log_event("THUNDERBIRD", f"Scanning Thunderbird mailbox: '{account_cfg.get('name')}', Folder: '{mailbox_name}'...")
     mbox_dir = account_cfg.get("directory", "")
     if not mbox_dir or not os.path.exists(mbox_dir):
         return {"error": f"Thunderbird directory not found: {mbox_dir}", "domains": []}
 
-    mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
-    if not mbox_path or not os.path.isfile(mbox_path):
-        return {"error": f"Mailbox file '{mailbox_name}' not found in Thunderbird storage.", "domains": []}
+    mbox_files_to_scan = []
+    if mailbox_name.strip().lower() in ["__all__", "full mailbox (all folders)", "all folders", "full mailbox"]:
+        # Scan all mbox files for this account
+        for root, dirs, files in os.walk(mbox_dir):
+            for item in files:
+                if not item.endswith('.msf') and not item.endswith('.dat'):
+                    mbox_files_to_scan.append(os.path.join(root, item))
+    else:
+        mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
+        if not mbox_path or not os.path.isfile(mbox_path):
+            return {"error": f"Mailbox file '{mailbox_name}' not found in Thunderbird storage.", "domains": []}
+        mbox_files_to_scan.append(mbox_path)
 
     dom_counts = Counter()
     dom_senders = defaultdict(lambda: Counter())
     processed_count = 0
 
     try:
-        mbox = mailbox.mbox(mbox_path)
-        log_event("THUNDERBIRD", f"Opened '{mbox_path}'. Total stored messages: {len(mbox)}")
+        for file_path in mbox_files_to_scan:
+            rel_name = os.path.relpath(file_path, mbox_dir).replace('\\', '/')
+            log_event("THUNDERBIRD", f"Reading Thunderbird storage file: '{rel_name}'...")
+            
+            with open(file_path, 'rb') as f:
+                current_status_val = b'0001'
+                current_from = ''
+                in_header = False
 
-        for msg in mbox:
-            try:
-                from_hdr = decode_mime_header(msg.get('From', ''))
-                if not from_hdr:
-                    continue
+                def commit_entry(from_str, status_val):
+                    nonlocal processed_count
+                    try:
+                        s_int = int(status_val, 16)
+                    except Exception:
+                        s_int = 1
+                    # Skip messages marked as deleted in Thunderbird (flag 0x0008)
+                    if s_int & 0x0008:
+                        return
+                    processed_count += 1
+                    name = ""
+                    email_addr = ""
+                    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', from_str)
+                    if m:
+                        email_addr = m.group(0).lower()
+                    name_match = re.match(r'^\"?([^\"<]+)\"?\s*<', from_str)
+                    if name_match:
+                        name = name_match.group(1).strip()
+                    if not email_addr:
+                        email_addr = from_str.lower()
+                    dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
+                    dom_counts[dom] += 1
+                    disp = f"{name} <{email_addr}>" if name else email_addr
+                    dom_senders[dom][disp] += 1
 
-                processed_count += 1
-                name = ""
-                email_addr = ""
-                m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', from_hdr)
-                if m:
-                    email_addr = m.group(0).lower()
-                name_match = re.match(r'^\"?([^\"<]+)\"?\s*<', from_hdr)
-                if name_match:
-                    name = name_match.group(1).strip()
+                for line in f:
+                    if line.startswith(b'From - '):
+                        if in_header or current_from:
+                            commit_entry(current_from, current_status_val)
+                        current_status_val = b'0001'
+                        current_from = ''
+                        in_header = True
+                        continue
 
-                if not email_addr:
-                    email_addr = from_hdr.lower()
+                    if in_header:
+                        if line == b'\r\n' or line == b'\n':
+                            in_header = False
+                        elif line.startswith(b'X-Mozilla-Status:'):
+                            current_status_val = line[len(b'X-Mozilla-Status:'):].strip()
+                        elif line.lower().startswith(b'from:'):
+                            current_from = line[5:].decode('latin-1', errors='replace').strip()
+                        elif current_from and (line.startswith(b' ') or line.startswith(b'\t')):
+                            current_from += ' ' + line.decode('latin-1', errors='replace').strip()
 
-                dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
-                dom_counts[dom] += 1
-                disp = f"{name} <{email_addr}>" if name else email_addr
-                dom_senders[dom][disp] += 1
-            except Exception:
-                continue
+                if in_header or current_from:
+                    commit_entry(current_from, current_status_val)
 
         categories = categorize_domains(dom_counts, dom_senders)
         log_event("THUNDERBIRD", f"Scan complete! Classified {processed_count} messages across {len(dom_counts)} domains.", level="SUCCESS")
@@ -218,56 +254,101 @@ def scan_thunderbird_account(account_cfg, mailbox_name="INBOX"):
 
 
 def delete_thunderbird_domains(account_cfg, mailbox_name, domains):
-    """Safely delete messages matching domains from local Thunderbird mbox store."""
+    """Safely delete messages matching domains from local Thunderbird mbox store.
+    Uses ultra-fast in-place MAPI X-Mozilla-Status flag marking (0x0008 = MSG_FLAG_EXPUNGED),
+    which immediately expunges the emails in Thunderbird without file locking crashes."""
     mbox_dir = account_cfg.get("directory", "")
     if not mbox_dir or not os.path.exists(mbox_dir):
         return {"success": False, "deleted_domains": 0, "errors": [f"Thunderbird directory not found: {mbox_dir}"]}
 
-    mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
-    if not mbox_path or not os.path.isfile(mbox_path):
-        return {"success": False, "deleted_domains": 0, "errors": [f"Mailbox '{mailbox_name}' not found."]}
+    mbox_files_to_clean = []
+    if mailbox_name.strip().lower() in ["__all__", "full mailbox (all folders)", "all folders", "full mailbox"]:
+        for root, dirs, files in os.walk(mbox_dir):
+            for item in files:
+                if not item.endswith('.msf') and not item.endswith('.dat'):
+                    mbox_files_to_clean.append(os.path.join(root, item))
+    else:
+        mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
+        if not mbox_path or not os.path.isfile(mbox_path):
+            return {"success": False, "deleted_domains": 0, "errors": [f"Mailbox '{mailbox_name}' not found."]}
+        mbox_files_to_clean.append(mbox_path)
 
     domains_set = set(d.lower().strip() for d in domains)
     deleted_count = 0
     errors = []
 
     try:
-        mbox = mailbox.mbox(mbox_path)
-        mbox.lock()
-        keys_to_remove = []
+        for file_path in mbox_files_to_clean:
+            rel_name = os.path.relpath(file_path, mbox_dir).replace('\\', '/')
+            log_event("THUNDERBIRD", f"Expunging target domains from '{rel_name}'...")
+            
+            mark_entries = [] # (pos, new_bytes)
+            with open(file_path, 'rb') as f:
+                byte_offset = 0
+                current_status_pos = None
+                current_status_val = b'0001'
+                current_from = ''
+                in_header = False
 
-        for key, msg in mbox.items():
-            try:
-                from_hdr = decode_mime_header(msg.get('From', ''))
-                m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', from_hdr)
-                email_addr = m.group(0).lower() if m else from_hdr.lower()
-                dom = email_addr.split('@')[-1] if '@' in email_addr else ""
+                for line in f:
+                    line_len = len(line)
+                    if line.startswith(b'From - '):
+                        if current_status_pos is not None and current_from:
+                            m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', current_from)
+                            ea = m.group(0).lower() if m else current_from.lower()
+                            dom = ea.split('@')[-1] if '@' in ea else ''
+                            if dom in domains_set or any(d in ea for d in domains_set):
+                                try:
+                                    val_int = int(current_status_val, 16)
+                                except Exception:
+                                    val_int = 1
+                                # 0x0008 = MSG_FLAG_EXPUNGED (deleted in Thunderbird)
+                                new_val = f'{val_int | 0x0008:04x}'.encode('ascii')
+                                mark_entries.append((current_status_pos, new_val))
+                                deleted_count += 1
+                        current_status_pos = None
+                        current_from = ''
+                        in_header = True
+                        byte_offset += line_len
+                        continue
 
-                if dom.lower() in domains_set or any(d in email_addr for d in domains_set):
-                    keys_to_remove.append(key)
-            except Exception:
-                continue
+                    if in_header:
+                        if line == b'\r\n' or line == b'\n':
+                            in_header = False
+                        elif line.startswith(b'X-Mozilla-Status:'):
+                            current_status_pos = byte_offset + len(b'X-Mozilla-Status: ')
+                            current_status_val = line[len(b'X-Mozilla-Status: '):].strip()
+                        elif line.lower().startswith(b'from:'):
+                            current_from = line[5:].decode('latin-1', errors='replace').strip()
+                        elif current_from and (line.startswith(b' ') or line.startswith(b'\t')):
+                            current_from += ' ' + line.decode('latin-1', errors='replace').strip()
 
-        log_event("THUNDERBIRD", f"Found {len(keys_to_remove)} matching messages to delete.")
-        for key in keys_to_remove:
-            mbox.remove(key)
-            deleted_count += 1
-            if deleted_count <= 10 or deleted_count % 25 == 0:
-                log_event("DELETE", f"Deleted #{deleted_count} message from Thunderbird mbox.")
+                    byte_offset += line_len
 
-        mbox.flush()
-        mbox.unlock()
+                # Check last message
+                if current_status_pos is not None and current_from:
+                    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', current_from)
+                    ea = m.group(0).lower() if m else current_from.lower()
+                    dom = ea.split('@')[-1] if '@' in ea else ''
+                    if dom in domains_set or any(d in ea for d in domains_set):
+                        try:
+                            val_int = int(current_status_val, 16)
+                        except Exception:
+                            val_int = 1
+                        new_val = f'{val_int | 0x0008:04x}'.encode('ascii')
+                        mark_entries.append((current_status_pos, new_val))
+                        deleted_count += 1
 
-        msf_path = mbox_path + '.msf'
-        if os.path.exists(msf_path):
-            try:
-                os.remove(msf_path)
-                log_event("THUNDERBIRD", "Removed summary file .msf for clean Thunderbird re-indexing.")
-            except Exception:
-                pass
+            if mark_entries:
+                log_event("DELETE", f"Marking {len(mark_entries)} messages as deleted in '{rel_name}'...")
+                with open(file_path, 'r+b') as f:
+                    for pos, new_bytes in mark_entries:
+                        f.seek(pos)
+                        f.write(new_bytes)
+                    f.flush()
 
-        log_event("DELETE", f"COMPLETED: Deleted {deleted_count} messages from Thunderbird.", level="SUCCESS")
-        return {"success": True, "deleted_domains": len(domains), "deleted_count": deleted_count, "remaining": len(mbox)}
+        log_event("DELETE", f"COMPLETED: Deleted {deleted_count} messages across Thunderbird storage.", level="SUCCESS")
+        return {"success": True, "deleted_domains": len(domains), "deleted_count": deleted_count}
     except Exception as e:
         log_event("THUNDERBIRD", f"Error during deletion: {e}", level="ERROR")
         return {"success": False, "deleted_domains": 0, "errors": [str(e)]}

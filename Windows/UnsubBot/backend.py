@@ -646,112 +646,123 @@ def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
 
 
 def scan_thunderbird_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
-    """Scan local Thunderbird mbox store for newsletter subscriptions & unsubscribe headers."""
+    """Scan local Thunderbird mbox store for newsletter subscriptions & unsubscribe headers using fast streaming."""
     log_event("THUNDERBIRD", f"Scanning Thunderbird mailbox: '{account_cfg.get('name')}', Folder: '{mailbox_name}', Limit: {limit}...")
     mbox_dir = account_cfg.get("directory", "")
     if not mbox_dir or not os.path.exists(mbox_dir):
         return {"error": f"Thunderbird directory not found: {mbox_dir}", "subscriptions": [], "total_scanned": 0}
 
-    mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
-    if not mbox_path or not os.path.isfile(mbox_path):
-        return {"error": f"Mailbox file '{mailbox_name}' not found in Thunderbird storage.", "subscriptions": [], "total_scanned": 0}
+    mbox_files_to_scan = []
+    if mailbox_name.strip().lower() in ["__all__", "full mailbox (all folders)", "all folders", "full mailbox"]:
+        for root, dirs, files in os.walk(mbox_dir):
+            for item in files:
+                if not item.endswith('.msf') and not item.endswith('.dat'):
+                    mbox_files_to_scan.append(os.path.join(root, item))
+    else:
+        mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
+        if not mbox_path or not os.path.isfile(mbox_path):
+            return {"error": f"Mailbox file '{mailbox_name}' not found in Thunderbird storage.", "subscriptions": [], "total_scanned": 0}
+        mbox_files_to_scan.append(mbox_path)
 
-    domain_msgs = defaultdict(list)
+    domain_msgs = defaultdict(int)
     domain_latest_meta = {}
     total_scanned = 0
 
     try:
-        mbox = mailbox.mbox(mbox_path)
-        total_items = len(mbox)
-        log_event("THUNDERBIRD", f"Opened '{mbox_path}'. Total stored messages: {total_items}")
+        for file_path in mbox_files_to_scan:
+            rel_name = os.path.relpath(file_path, mbox_dir).replace('\\', '/')
+            log_event("THUNDERBIRD", f"Streaming messages from '{rel_name}'...")
 
-        if total_items == 0:
-            return {"account": account_cfg.get("name"), "mailbox": mailbox_name, "total_scanned": 0, "unique_domains": 0, "subscriptions": []}
+            # Collect headers using streaming parser
+            headers_list = []
+            with open(file_path, 'r', encoding='latin-1', errors='replace') as f:
+                in_header = False
+                headers = {}
+                curr_key = ''
+                for line in f:
+                    if line.startswith('From - '):
+                        if in_header or headers:
+                            headers_list.append(headers)
+                            if limit > 0 and len(headers_list) > limit * 2:
+                                headers_list = headers_list[-limit:]
+                            headers = {}
+                            curr_key = ''
+                        in_header = True
+                        continue
 
-        scan_depth = total_items
-        if limit > 0 and limit < total_items:
-            scan_depth = limit
+                    if in_header:
+                        if line == '\n' or line == '\r\n':
+                            in_header = False
+                        elif line.startswith(' ') or line.startswith('\t'):
+                            if curr_key and curr_key in headers:
+                                headers[curr_key] += ' ' + line.strip()
+                        elif ':' in line:
+                            k, v = line.split(':', 1)
+                            curr_key = k.lower().strip()
+                            if curr_key in ['from', 'subject', 'list-unsubscribe', 'list-unsubscribe-post', 'x-mozilla-status']:
+                                headers[curr_key] = v.strip()
 
-        log_event("THUNDERBIRD", f"Scanning up to {scan_depth} messages for newsletter subscriptions...")
+                if in_header or headers:
+                    headers_list.append(headers)
+                    if limit > 0 and len(headers_list) > limit:
+                        headers_list = headers_list[-limit:]
 
-        # Scan backwards (latest messages first)
-        keys = list(mbox.keys())
-        keys.reverse()
-
-        for idx, key in enumerate(keys[:scan_depth]):
-            try:
-                msg = mbox[key]
-                from_hdr = decode_mime_header(msg.get('From', ''))
-                if not from_hdr:
+            # Inspect latest messages first
+            headers_list.reverse()
+            for idx, h in enumerate(headers_list):
+                # Skip messages marked as deleted in Thunderbird (0x0008)
+                stat_val = h.get('x-mozilla-status', '0001')
+                try:
+                    s_int = int(stat_val, 16)
+                except Exception:
+                    s_int = 1
+                if s_int & 0x0008:
                     continue
 
-                subj = decode_mime_header(msg.get('Subject', ''))
+                total_scanned += 1
+                from_hdr = decode_mime_header(h.get('from', ''))
+                subj = decode_mime_header(h.get('subject', ''))
                 m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', from_hdr)
                 email_addr = m.group(0).lower() if m else from_hdr.lower()
                 dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
 
-                domain_msgs[dom].append(key)
-                total_scanned += 1
-
+                domain_msgs[dom] += 1
                 if dom not in domain_latest_meta:
                     domain_latest_meta[dom] = {
-                        "key": key,
                         "sender": from_hdr,
                         "subject": subj,
-                        "msg": msg
+                        "headers": h
                     }
-            except Exception:
-                continue
 
         log_event("THUNDERBIRD", f"Sampled {total_scanned} emails across {len(domain_msgs)} unique sender domains.")
 
-        sorted_domains = sorted(domain_msgs.keys(), key=lambda d: len(domain_msgs[d]), reverse=True)
+        sorted_domains = sorted(domain_msgs.keys(), key=lambda d: domain_msgs[d], reverse=True)
         discovered = []
-        inspection_limit = 100
+        inspection_limit = 150
 
         for dom in sorted_domains[:inspection_limit]:
             meta = domain_latest_meta[dom]
-            msg = meta["msg"]
+            h = meta["headers"]
 
             # RFC List-Unsubscribe
-            unsub_header = decode_mime_header(msg.get('List-Unsubscribe', ''))
-            post_header = decode_mime_header(msg.get('List-Unsubscribe-Post', ''))
+            unsub_header = decode_mime_header(h.get('list-unsubscribe', ''))
+            post_header = decode_mime_header(h.get('list-unsubscribe-post', ''))
             combined_headers = f"List-Unsubscribe: {unsub_header}\nList-Unsubscribe-Post: {post_header}"
 
             http_unsub, mailto_unsub, is_one_click = parse_list_unsubscribe_headers(combined_headers)
 
-            # Web links from HTML body
-            html_body = ""
-            try:
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == 'text/html':
-                            payload = part.get_payload(decode=True)
-                            charset = part.get_content_charset() or 'utf-8'
-                            html_body = payload.decode(charset, errors='ignore')
-                            break
-                else:
-                    if msg.get_content_type() == 'text/html':
-                        payload = msg.get_payload(decode=True)
-                        charset = msg.get_content_charset() or 'utf-8'
-                        html_body = payload.decode(charset, errors='ignore')
-            except Exception:
-                pass
-
-            web_links = extract_web_unsubscribe_links(html_body)
-
-            if http_unsub or mailto_unsub or web_links:
+            if http_unsub or mailto_unsub:
                 discovered.append({
-                    "message_id": str(meta["key"]),
+                    "message_id": dom,
                     "domain": dom,
-                    "email_count": len(domain_msgs[dom]),
+                    "email_count": domain_msgs[dom],
                     "sender": meta["sender"],
                     "subject": meta["subject"],
                     "rfc_unsubscribe": http_unsub or mailto_unsub,
                     "rfc_http": http_unsub,
                     "rfc_mailto": mailto_unsub,
                     "rfc_one_click": is_one_click,
-                    "web_links": web_links
+                    "web_links": []
                 })
 
         log_event("THUNDERBIRD", f"Scan complete! Discovered {len(discovered)} active subscriptions in Thunderbird.", level="SUCCESS")
