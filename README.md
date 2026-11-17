@@ -142,7 +142,7 @@ Email Cleaner is proudly engineered and maintained under the digital infrastruct
   </a>
 </p>
 
-* **Website:** [https://globaladsmedia.us](https://globaladsmedia.us)
+* **Website:** <a href="https://globaladsmedia.us" target="_blank" rel="noopener noreferrer">https://globaladsmedia.us</a>
 * **Sector:** Enterprise Digital Marketing, AdTech Infrastructure & Global Traffic Aggregation
 * **Overview:** Global Ads Media operates automated programmatic advertising, high-volume Real-Time Bidding (RTB), and audience segmentation engines, linking next-generation web technologies, fintech, and digital media platforms into a unified commercial ecosystem.
 
@@ -304,14 +304,14 @@ Email Cleaner is proudly engineered and maintained under the digital infrastruct
     </tr>
     <tr>
       <td align="center">
-        <a href="https://tryyourluck.today" target="_blank">
-          <img src="https://github.com/gamgsp/globaldata/blob/main/Try%20Your%20Luck/tryyourluck-logo-dark.png?raw=true" alt="Try Your Luck" width="140" /><br />
+        <a href="https://tryyourluck.today" target="_blank" rel="noopener noreferrer">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Try%20Your%20Luck/tryyourluck-logo.png?raw=true" alt="Try Your Luck" width="140" /><br />
           <strong>Try Your Luck</strong>
         </a>
       </td>
       <td><strong>Digital Goods & Draws</strong></td>
       <td>
-        <strong>Website:</strong> <a href="https://tryyourluck.today" target="_blank">tryyourluck.today</a><br />
+        <strong>Website:</strong> <a href="https://tryyourluck.today" target="_blank" rel="noopener noreferrer">tryyourluck.today</a><br />
         A modern digital marketplace offering $1.00 utility software and digital downloads bundled with bonus tickets into provably fair prize draws.
       </td>
     </tr>
@@ -322,4 +322,4 @@ Email Cleaner is proudly engineered and maintained under the digital infrastruct
 
 ## 📄 License
 
-MIT License. Developed and maintained by [Global Ads Media, LLC](https://globaladsmedia.us). Free and open-source for personal and commercial productivity.
+MIT License. Developed and maintained by <a href="https://globaladsmedia.us" target="_blank" rel="noopener noreferrer">Global Ads Media, LLC</a>. Free and open-source for personal and commercial productivity.
