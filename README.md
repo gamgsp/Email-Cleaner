@@ -23,6 +23,8 @@ Supports **Mozilla Thunderbird** (1-click zero-setup modern OAuth2), **Apple Mai
   - **Windows**: Automatically interfaces with **Thunderbird** and **Microsoft Outlook** stores.
 - **📊 Real-Time Terminal & Web Telemetry**:
   - Live console output with timestamps and visual badges for each phase of scanning, batch deletions, and unsubscription attempts.
+- **🛡️ Auto-Self-Healing Launchers**:
+  - Launch scripts automatically detect Python, install it if missing, initialize a virtual environment (`venv`), and install all dependencies automatically.
 
 ---
 
@@ -33,23 +35,27 @@ Email Cleaner/
 ├── Windows/
 │   ├── MailSweep/               # Bulk email categorization & deletion engine (Port 7890)
 │   │   ├── backend.py
+│   │   ├── run_cleaner.bat      # Standalone cleaner launcher with auto-venv
 │   │   └── static/              # Modern glassmorphism dark-theme web dashboard
 │   ├── UnsubBot/                # Multi-protocol automated unsubscriber (Port 7891)
 │   │   ├── backend.py
+│   │   ├── run_unsubscriber.bat # Standalone unsubscriber launcher with auto-venv
 │   │   └── static/
 │   ├── requirements.txt
-│   ├── start_windows_suite.bat  # 1-Click launcher menu for Windows
+│   ├── start_windows_suite.bat  # 1-Click launcher menu for Windows (auto-python, auto-venv)
 │   └── stop_servers.bat         # Clean shutdown script
 │
 ├── MacOs/
 │   ├── MailSweep/               # Apple Mail & Thunderbird cleaner for macOS (Port 7890)
 │   │   ├── backend.py
+│   │   ├── run_cleaner.command  # Standalone cleaner launcher for Mac
 │   │   └── static/
 │   ├── UnsubBot/                # Apple Mail & Thunderbird unsubscriber for macOS (Port 7891)
 │   │   ├── backend.py
+│   │   ├── run_unsubscriber.command # Standalone unsubscriber launcher for Mac
 │   │   └── static/
 │   ├── requirements.txt
-│   ├── start_macos_suite.command# 1-Click launcher for macOS
+│   ├── start_macos_suite.command# 1-Click launcher for macOS (auto-python, auto-venv)
 │   └── INSTRUCTIONS.txt
 │
 └── README.md
@@ -61,42 +67,22 @@ Email Cleaner/
 
 ### Prerequisites
 
-- **Python 3.8+** installed.
+- **Python 3.8+** (Launchers will auto-install or guide you if not present).
 - **Mozilla Thunderbird** (Recommended for easiest 1-click modern Google & Microsoft account connection) OR native **Apple Mail** (on Mac) / **Classic Outlook** (on Windows).
 - **Google Chrome** browser (for UnsubBot's headless form solver).
 
-### 1. Install Dependencies
+### 🚦 How to Run
 
-#### On Windows:
-```cmd
-cd Windows
-pip install -r requirements.txt
-```
+#### Windows
+Simply double-click `start_windows_suite.bat`:
+- It checks Python, creates a local `venv`, installs dependencies, and displays the launch menu.
+- Choose:
+  1. **Launch MailSweep** (`http://localhost:7890`)
+  2. **Launch UnsubBot** (`http://localhost:7891`)
+  3. **Launch Both Applications** (Side-by-side terminal windows with live telemetry)
 
-#### On macOS:
-```bash
-cd MacOs
-pip install -r requirements.txt
-```
-
-*(Note: Playwright utilizes your installed Google Chrome browser to automate web unsubscription portals).*
-
----
-
-## 🚦 How to Run
-
-### Windows
-Double-click `start_windows_suite.bat` (or run it via Command Prompt/PowerShell):
-```cmd
-start_windows_suite.bat
-```
-Choose from the interactive menu:
-1. **Launch MailSweep** (`http://localhost:7890`)
-2. **Launch UnsubBot** (`http://localhost:7891`)
-3. **Launch Both Applications** (Opens side-by-side terminal windows with live logging)
-
-### macOS
-Double-click `start_macos_suite.command` or run in Terminal:
+#### macOS
+Simply double-click `start_macos_suite.command` or execute in Terminal:
 ```bash
 chmod +x start_macos_suite.command
 ./start_macos_suite.command
@@ -145,14 +131,195 @@ chmod +x start_macos_suite.command
 
 ---
 
-## 🔒 Privacy & Security
+## 🏢 Parent Company & Commercial Subsidiaries Matrix
 
-- **100% Local & Offline First**: Runs entirely on your local machine (`localhost`).
-- **No Third-Party Cloud Servers**: Your emails, credentials, and data are never transmitted to external services.
-- **Safe Deletion**: Deletions move messages to your account's standard Trash/Deleted Items folder rather than permanently purging them without recovery.
+Email Cleaner is proudly engineered and maintained under the digital infrastructure and technology umbrella of **Global Ads Media, LLC**.
+
+### Global Ads Media, LLC (Parent Organization)
+<p align="center">
+  <a href="https://globaladsmedia.us" target="_blank">
+    <img src="https://github.com/gamgsp/globaldata/blob/main/Global%20Ads%20Media/globaladsmedia-black-1024-300.png?raw=true" alt="Global Ads Media, LLC" width="280" />
+  </a>
+</p>
+
+* **Website:** [https://globaladsmedia.us](https://globaladsmedia.us)
+* **Sector:** Enterprise Digital Marketing, AdTech Infrastructure & Global Traffic Aggregation
+* **Overview:** Global Ads Media operates automated programmatic advertising, high-volume Real-Time Bidding (RTB), and audience segmentation engines, linking next-generation web technologies, fintech, and digital media platforms into a unified commercial ecosystem.
+
+---
+
+### Commercial Subsidiaries
+
+<table>
+  <thead>
+    <tr>
+      <th width="200">Subsidiary</th>
+      <th width="140">Sector</th>
+      <th>Commercial Description & Official Website</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center">
+        <a href="https://1dollarcloud.com" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/1dollarcloud/1dollarcloud-black-1024-210.png?raw=true" alt="1 Dollar Cloud" width="140" /><br />
+          <strong>1 Dollar Cloud</strong>
+        </a>
+      </td>
+      <td><strong>Cloud & Hosting</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://1dollarcloud.com" target="_blank">1dollarcloud.com</a><br />
+        Affordable, high-performance NVMe cloud hosting, Cloud VPS, dedicated infrastructure, and domain registration starting at just $1 per month.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://gspcoin.us" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/GSP%20Coin/gspcname%201024x452%20black.png?raw=true" alt="GSP Coin" width="140" /><br />
+          <strong>GSP Coin</strong>
+        </a>
+      </td>
+      <td><strong>Layer-1 Blockchain</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://gspcoin.us" target="_blank">gspcoin.us</a><br />
+        An enterprise-grade, decentralized Layer-1 cryptocurrency designed for global commercial transactions, high-yield Smartnodes, and AdTech settlement.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://exchange.gspcoin.us" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/GSPC%20Exchange/gspcexc-dark-logo.png?raw=true" alt="GSPC Exchange" width="140" /><br />
+          <strong>GSPC Exchange</strong>
+        </a>
+      </td>
+      <td><strong>DeFi & P2P Trading</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://exchange.gspcoin.us" target="_blank">exchange.gspcoin.us</a><br />
+        A secure, non-custodial P2P cryptocurrency escrow exchange featuring automated order matching, multi-chain settlement, and zero middleman risk.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://1url.my" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/1url/1url-black-1024-380.png?raw=true" alt="1url" width="140" /><br />
+          <strong>1url</strong>
+        </a>
+      </td>
+      <td><strong>Enterprise SaaS</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://1url.my" target="_blank">1url.my</a><br />
+        A high-performance URL shortening and link management service that allows businesses and individuals to create custom, branded, and trackable smart links.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://globaltradepulse.com" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Global%20Trade%20Pulse/gtp-logo-black.png?raw=true" alt="Global Trade Pulse" width="140" /><br />
+          <strong>Global Trade Pulse</strong>
+        </a>
+      </td>
+      <td><strong>Quantitative Intelligence</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://globaltradepulse.com" target="_blank">globaltradepulse.com</a><br />
+        An algorithmic financial intelligence and multi-market scanner platform providing real-time technical analysis across US equities, Indian markets, gold, and forex.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://worldnewsguru.us" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/World%20News%20Guru/wnglogo-black-1024-330.png?raw=true" alt="World News Guru" width="140" /><br />
+          <strong>World News Guru</strong>
+        </a>
+      </td>
+      <td><strong>Global Journalism</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://worldnewsguru.us" target="_blank">worldnewsguru.us</a><br />
+        A premier digital media platform that aggregates news from multiple verified global sources in a comprehensive, fast, and unbiased manner.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://globalcricinfo.com" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Global%20Cric%20Info/global%20cric%20info%20logo%20black.png?raw=true" alt="Global Cric Info" width="140" /><br />
+          <strong>Global Cric Info</strong>
+        </a>
+      </td>
+      <td><strong>Sports Media</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://globalcricinfo.com" target="_blank">globalcricinfo.com</a><br />
+        An international sports media portal offering real-time ball-by-ball updates on cricket scores, breaking tournament news, schedules, and player telemetry.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://globalsocialpost.com" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Global%20Social%20Post/globalsocialpost-black-1024-300.png?raw=true" alt="Global Social Post" width="140" /><br />
+          <strong>Global Social Post</strong>
+        </a>
+      </td>
+      <td><strong>Social Automation</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://globalsocialpost.com" target="_blank">globalsocialpost.com</a><br />
+        An omni-channel social media automation platform that allows businesses and agencies to design, schedule, and automate posts across multiple channels simultaneously.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://globalsmtpmail.com" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Global%20Smtp%20Mail/gsm-black-1024-320.png?raw=true" alt="Global SMTP Mail" width="140" /><br />
+          <strong>Global SMTP Mail</strong>
+        </a>
+      </td>
+      <td><strong>Email Infrastructure</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://globalsmtpmail.com" target="_blank">globalsmtpmail.com</a><br />
+        A reliable, high-throughput email delivery service and enterprise SMTP relay infrastructure that guarantees superior inbox deliverability rates.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://globalintelinvest.com" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Global%20Intel%20Invest/glob_int_inv_black_logo.png?raw=true" alt="Global Intel Invest" width="140" /><br />
+          <strong>Global Intel Invest</strong>
+        </a>
+      </td>
+      <td><strong>Financial Insights</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://globalintelinvest.com" target="_blank">globalintelinvest.com</a><br />
+        An intelligent investment research platform delivering real-time economic data, institutional market analysis, and actionable macroeconomic insights.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://traffixpert.com" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Traffixpert/traffixpert-black-1024-410.png?raw=true" alt="Traffixpert" width="140" /><br />
+          <strong>Traffixpert</strong>
+        </a>
+      </td>
+      <td><strong>AdTech & Traffic</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://traffixpert.com" target="_blank">traffixpert.com</a><br />
+        A performance digital marketing network that connects web publishers and advertisers to drive high-converting, targeted organic and paid traffic.
+      </td>
+    </tr>
+    <tr>
+      <td align="center">
+        <a href="https://tryyourluck.today" target="_blank">
+          <img src="https://github.com/gamgsp/globaldata/blob/main/Try%20Your%20Luck/tryyourluck-logo-dark.png?raw=true" alt="Try Your Luck" width="140" /><br />
+          <strong>Try Your Luck</strong>
+        </a>
+      </td>
+      <td><strong>Digital Goods & Draws</strong></td>
+      <td>
+        <strong>Website:</strong> <a href="https://tryyourluck.today" target="_blank">tryyourluck.today</a><br />
+        A modern digital marketplace offering $1.00 utility software and digital downloads bundled with bonus tickets into provably fair prize draws.
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
 ## 📄 License
 
-MIT License. Free and open source for personal and commercial productivity.
+MIT License. Developed and maintained by [Global Ads Media, LLC](https://globaladsmedia.us). Free and open-source for personal and commercial productivity.
