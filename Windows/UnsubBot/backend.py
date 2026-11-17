@@ -279,10 +279,47 @@ def discover_thunderbird_accounts():
 # ==============================================================================
 # OUTLOOK COM MAPI ENGINE
 # ==============================================================================
+def is_outlook_configured():
+    """Checks Windows Registry to verify if an active email account is configured in Outlook."""
+    import winreg
+    keys = [
+        r"Software\Microsoft\Office\16.0\Outlook\Profiles",
+        r"Software\Microsoft\Office\15.0\Outlook\Profiles",
+        r"Software\Microsoft\Office\14.0\Outlook\Profiles",
+        r"Software\Microsoft\Windows NT\CurrentVersion\Windows Messaging Subsystem\Profiles"
+    ]
+    for key_path in keys:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as k:
+                num_subkeys, _, _ = winreg.QueryInfoKey(k)
+                for i in range(num_subkeys):
+                    prof_name = winreg.EnumKey(k, i)
+                    try:
+                        acc_path = f"{key_path}\\{prof_name}\\9375CFF0413111d3B88A00104B2A6676"
+                        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, acc_path) as ak:
+                            n_acc, _, _ = winreg.QueryInfoKey(ak)
+                            for j in range(n_acc):
+                                sub = winreg.EnumKey(ak, j)
+                                try:
+                                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{acc_path}\\{sub}") as sk:
+                                        svc_name, _ = winreg.QueryValueEx(sk, "Service Name")
+                                        if svc_name and svc_name.upper() != "CONTAB":
+                                            return True
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return False
+
+
 def get_outlook_namespace():
-    """Initializes COM and returns the Outlook MAPI namespace."""
+    """Initializes COM and returns the Outlook MAPI namespace, if Outlook is configured."""
     if not HAS_WIN32:
         raise RuntimeError("pywin32 is not installed. Install via: pip install pywin32")
+    if not is_outlook_configured():
+        raise RuntimeError("No configured email accounts found in Microsoft Outlook profile.")
     pythoncom.CoInitialize()
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
