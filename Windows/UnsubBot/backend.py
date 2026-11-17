@@ -385,7 +385,17 @@ def get_mail_accounts():
     com_error = None
     com_available = False
 
-    # 1. Try Classic Outlook COM
+    # 1. Auto-discover Mozilla Thunderbird accounts first (offline local storage ready)
+    tb_accounts = discover_thunderbird_accounts()
+    for acc in tb_accounts:
+        acc_key = acc['name'].lower()
+        if acc_key not in seen:
+            accounts.append(acc)
+            seen.add(acc_key)
+            if acc.get('email'):
+                seen.add(acc['email'].lower())
+
+    # 2. Try Classic Outlook COM
     if HAS_WIN32:
         try:
             mapi = get_outlook_namespace()
@@ -431,11 +441,11 @@ def get_mail_accounts():
                 com_error = f"Outlook COM error: {err_str}"
                 log_event("ACCOUNTS", com_error, level="WARNING")
 
-    # 2. Load saved configs
+    # 3. Load saved configs
     saved_imap = load_saved_accounts()
     saved_by_email = {a.get('email', '').lower(): a for a in saved_imap if a.get('email')}
 
-    # 3. Auto-discover Windows Outlook / Live accounts
+    # 4. Auto-discover Windows Outlook / Live accounts
     auto_accounts = discover_windows_email_accounts()
     for acc in auto_accounts:
         em = acc['email'].lower()
@@ -454,16 +464,6 @@ def get_mail_accounts():
             seen.add(em)
             seen.add(acc['name'].lower())
             log_event("ACCOUNTS", f"Auto-discovered Windows Outlook account: {acc['name']} <{acc['email']}>")
-
-    # 4. Auto-discover Mozilla Thunderbird accounts
-    tb_accounts = discover_thunderbird_accounts()
-    for acc in tb_accounts:
-        acc_key = acc['name'].lower()
-        if acc_key not in seen:
-            accounts.append(acc)
-            seen.add(acc_key)
-            if acc.get('email'):
-                seen.add(acc['email'].lower())
 
     # 5. Any other saved IMAP accounts
     for acc in saved_imap:

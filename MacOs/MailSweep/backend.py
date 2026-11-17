@@ -413,11 +413,21 @@ def test_imap_connection(host, port, username, password, use_ssl=True):
 # APPLE MAIL DISCOVERY
 # ==============================================================================
 def get_mail_accounts():
-    """Discover all accounts configured in Apple Mail and saved IMAP configs."""
+    """Discover all accounts configured in Thunderbird, Apple Mail, and saved IMAP configs."""
     accounts = []
     seen = set()
 
-    # 1. Query Apple Mail
+    # 1. Add Thunderbird accounts first (local offline storage)
+    tb_accounts = discover_thunderbird_accounts()
+    for acc in tb_accounts:
+        acc_key = acc['name'].lower()
+        if acc_key not in seen:
+            accounts.append(acc)
+            seen.add(acc_key)
+            if acc.get('email'):
+                seen.add(acc['email'].lower())
+
+    # 2. Query Apple Mail
     cmd = """
     tell application "Mail"
         set accList to accounts
@@ -453,16 +463,6 @@ def get_mail_accounts():
             log_event("ACCOUNTS", f"AppleScript notice: {proc.stderr.strip()}", level="WARNING")
     except Exception as e:
         log_event("ACCOUNTS", f"Could not query Apple Mail: {e}", level="WARNING")
-
-    # 2. Add Thunderbird accounts
-    tb_accounts = discover_thunderbird_accounts()
-    for acc in tb_accounts:
-        acc_key = acc['name'].lower()
-        if acc_key not in seen:
-            accounts.append(acc)
-            seen.add(acc_key)
-            if acc.get('email'):
-                seen.add(acc['email'].lower())
 
     # 3. Add saved IMAP accounts
     saved_imap = load_saved_accounts()

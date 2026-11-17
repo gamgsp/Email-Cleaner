@@ -138,7 +138,7 @@ body {
 /* Controls Grid */
 .controls-grid {
   display: grid;
-  grid-template-columns: 1.5fr 1.5fr 1fr auto;
+  grid-template-columns: 2fr 1.4fr 1.4fr auto;
   gap: 16px;
   align-items: flex-end;
   margin-top: 20px;
