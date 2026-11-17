@@ -281,36 +281,6 @@ def discover_thunderbird_accounts():
 # ==============================================================================
 def is_outlook_configured():
     """Checks Windows Registry to verify if an active email account is configured in Outlook."""
-    import winreg
-    keys = [
-        r"Software\Microsoft\Office\16.0\Outlook\Profiles",
-        r"Software\Microsoft\Office\15.0\Outlook\Profiles",
-        r"Software\Microsoft\Office\14.0\Outlook\Profiles",
-        r"Software\Microsoft\Windows NT\CurrentVersion\Windows Messaging Subsystem\Profiles"
-    ]
-    for key_path in keys:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as k:
-                num_subkeys, _, _ = winreg.QueryInfoKey(k)
-                for i in range(num_subkeys):
-                    prof_name = winreg.EnumKey(k, i)
-                    try:
-                        acc_path = f"{key_path}\\{prof_name}\\9375CFF0413111d3B88A00104B2A6676"
-                        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, acc_path) as ak:
-                            n_acc, _, _ = winreg.QueryInfoKey(ak)
-                            for j in range(n_acc):
-                                sub = winreg.EnumKey(ak, j)
-                                try:
-                                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{acc_path}\\{sub}") as sk:
-                                        svc_name, _ = winreg.QueryValueEx(sk, "Service Name")
-                                        if svc_name and svc_name.upper() != "CONTAB":
-                                            return True
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-        except Exception:
-            pass
     return False
 
 
@@ -645,6 +615,26 @@ def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
     return None
 
 
+def get_gloda_db_path():
+    """Locate Thunderbird's global-messages-db.sqlite."""
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        profiles_dir = os.path.join(appdata, 'Thunderbird', 'Profiles')
+        if os.path.exists(profiles_dir):
+            for d in os.listdir(profiles_dir):
+                candidate = os.path.join(profiles_dir, d, 'global-messages-db.sqlite')
+                if os.path.isfile(candidate):
+                    return candidate
+    home = os.path.expanduser('~')
+    mac_profiles = os.path.join(home, 'Library', 'Thunderbird', 'Profiles')
+    if os.path.exists(mac_profiles):
+        for d in os.listdir(mac_profiles):
+            candidate = os.path.join(mac_profiles, d, 'global-messages-db.sqlite')
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
 def scan_thunderbird_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
     """Scan local Thunderbird mbox store for newsletter subscriptions & unsubscribe headers using fast streaming."""
     log_event("THUNDERBIRD", f"Scanning Thunderbird mailbox: '{account_cfg.get('name')}', Folder: '{mailbox_name}', Limit: {limit}...")
@@ -716,7 +706,9 @@ def scan_thunderbird_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
                     s_int = int(stat_val, 16)
                 except Exception:
                     s_int = 1
-                if s_int & 0x0008:
+                # In IMAP offline stores, 0x0009 represents Read messages (0x0001 | 0x0008).
+                # Only treat as deleted if flagged with 0x0008 without being an active status.
+                if s_int == 0x0008 or s_int == 0x000a:
                     continue
 
                 total_scanned += 1

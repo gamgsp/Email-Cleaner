@@ -3,7 +3,6 @@ import socketserver
 import json
 import urllib.parse
 import urllib.request
-import subprocess
 import re
 import os
 import sys
@@ -23,7 +22,15 @@ from bs4 import BeautifulSoup
 PORT = 7891
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts_config.json')
 
-# Check Playwright availability
+# Check pywin32 availability
+try:
+    import win32com.client
+    import pythoncom
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
+# Check Playwright availability for browser-level automation
 try:
     from playwright.sync_api import sync_playwright
     HAS_PLAYWRIGHT = True
@@ -43,7 +50,7 @@ def log_event(tag, message, level="INFO"):
         "SCAN": "🔍",
         "ACCOUNTS": "📫",
         "IMAP": "🌐",
-        "APPLEMAIL": "🍎",
+        "OUTLOOK": "📧",
         "THUNDERBIRD": "🦅",
         "FORM": "📝",
         "RFC": "⚡"
@@ -52,35 +59,155 @@ def log_event(tag, message, level="INFO"):
     print(f"[{ts}] {icon} [{tag}] {message}", flush=True)
 
 
-def decode_mime_header(header_val):
-    """Safely decode RFC 2047 MIME-encoded headers."""
-    if not header_val:
-        return ""
+# ==============================================================================
+# CONFIG & IMAP STORAGE
+# ==============================================================================
+def load_saved_accounts():
+    """Load saved IMAP accounts from JSON configuration file."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            log_event("ACCOUNTS", f"Failed to read {CONFIG_FILE}: {e}", level="WARNING")
+    return []
+
+
+def save_saved_accounts(accounts):
+    """Save IMAP accounts to JSON configuration file."""
     try:
-        parts = decode_header(header_val)
-        res = []
-        for text, enc in parts:
-            if isinstance(text, bytes):
-                res.append(text.decode(enc or 'utf-8', errors='ignore'))
-            else:
-                res.append(str(text))
-        return "".join(res)
-    except Exception:
-        return str(header_val)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(accounts, f, indent=2)
+        return True
+    except Exception as e:
+        log_event("ACCOUNTS", f"Failed to save {CONFIG_FILE}: {e}", level="ERROR")
+        return False
+
+
+def test_imap_connection(host, port, username, password, use_ssl=True):
+    """Test IMAP credentials and return available folders."""
+    log_event("IMAP", f"Testing connection to {host}:{port} (SSL: {use_ssl}) for '{username}'...")
+    try:
+        if use_ssl:
+            client = imaplib.IMAP4_SSL(host, int(port), timeout=15)
+        else:
+            client = imaplib.IMAP4(host, int(port), timeout=15)
+
+        client.login(username, password)
+        status, folder_data = client.list()
+        folders = []
+        if status == 'OK':
+            for item in folder_data:
+                s = item.decode('utf-8', errors='ignore') if isinstance(item, bytes) else str(item)
+                m = re.search(r'\((?P<flags>[^\)]*)\)\s+\"(?P<delim>[^\"]+)\"\s+(?P<name>.+)', s)
+                if m:
+                    fname = m.group('name').strip(' "')
+                    folders.append(fname)
+                else:
+                    parts = s.split(' ')
+                    folders.append(parts[-1].strip(' "'))
+        client.logout()
+        log_event("IMAP", f"Connection successful! Found {len(folders)} folders.", level="SUCCESS")
+        return True, folders, "Connected successfully"
+    except Exception as e:
+        log_event("IMAP", f"Connection failed: {str(e)}", level="ERROR")
+        return False, [], str(e)
 
 
 # ==============================================================================
-# THUNDERBIRD ACCOUNT AUTO-DISCOVERY & MBOX ENGINE (Cross-Platform)
+# AUTOMATIC WINDOWS ACCOUNT DISCOVERY (New Outlook / Live / Office)
+# ==============================================================================
+def discover_windows_email_accounts():
+    """Auto-discover accounts from New Outlook (OneAuth), Substrate, and Windows Registry."""
+    accounts = []
+    seen = set()
+
+    # 1. OneAuth accounts (New Outlook for Windows - olk.exe)
+    oneauth_dir = os.path.expandvars(r'%LOCALAPPDATA%\Microsoft\OneAuth\accounts')
+    if os.path.exists(oneauth_dir):
+        for fname in os.listdir(oneauth_dir):
+            fpath = os.path.join(oneauth_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    email_addr = data.get('email') or data.get('login_name')
+                    disp_name = data.get('display_name') or email_addr
+                    if email_addr and email_addr.lower() not in seen:
+                        accounts.append({
+                            'name': disp_name,
+                            'username': email_addr,
+                            'email': email_addr,
+                            'type': 'new_outlook',
+                            'host': 'outlook.office365.com',
+                            'port': 993,
+                            'ssl': True,
+                            'folders': ['Inbox', 'Junk Email', 'Deleted Items', 'Archive']
+                        })
+                        seen.add(email_addr.lower())
+            except Exception:
+                pass
+
+    # 2. Substrate Profile Aliases
+    blobs_dir = os.path.expandvars(r'%LOCALAPPDATA%\Microsoft\OneAuth\blobs')
+    if os.path.exists(blobs_dir):
+        for fpath in glob.glob(os.path.join(blobs_dir, '*_substrate_profile')):
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    pdata = json.load(f)
+                    for em in pdata.get('emails', []):
+                        ea = em.get('emailAddress')
+                        if ea and ea.lower() not in seen:
+                            accounts.append({
+                                'name': f'Outlook ({ea})',
+                                'username': ea,
+                                'email': ea,
+                                'type': 'new_outlook',
+                                'host': 'outlook.office365.com',
+                                'port': 993,
+                                'ssl': True,
+                                'folders': ['Inbox', 'Junk Email', 'Deleted Items', 'Archive']
+                            })
+                            seen.add(ea.lower())
+            except Exception:
+                pass
+
+    # 3. Windows IdentityCRL
+    try:
+        import winreg
+        key_path = r'Software\Microsoft\IdentityCRL\UserExtendedProperties'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            i = 0
+            while True:
+                try:
+                    subkey = winreg.EnumKey(key, i)
+                    if '@' in subkey and subkey.lower() not in seen:
+                        accounts.append({
+                            'name': f'Microsoft Account ({subkey})',
+                            'username': subkey,
+                            'email': subkey,
+                            'type': 'new_outlook',
+                            'host': 'outlook.office365.com',
+                            'port': 993,
+                            'ssl': True,
+                            'folders': ['Inbox', 'Junk Email', 'Deleted Items', 'Archive']
+                        })
+                        seen.add(subkey.lower())
+                    i += 1
+                except OSError:
+                    break
+    except Exception:
+        pass
+
+    return accounts
+
+
+# ==============================================================================
+# THUNDERBIRD ACCOUNT AUTO-DISCOVERY & MBOX ENGINE
 # ==============================================================================
 def discover_thunderbird_accounts():
-    """Auto-discover email accounts and local mbox stores from Mozilla Thunderbird on macOS / Windows."""
-    candidates = [
-        os.path.expanduser('~/Library/Thunderbird/Profiles'),
-        os.path.expandvars(r'%APPDATA%\Thunderbird\Profiles'),
-        os.path.expanduser('~/.thunderbird')
-    ]
-    tb_profiles_dir = next((c for c in candidates if os.path.exists(c)), None)
-    if not tb_profiles_dir:
+    """Auto-discover email accounts and local mbox stores from Mozilla Thunderbird."""
+    tb_profiles_dir = os.path.expandvars(r'%APPDATA%\Thunderbird\Profiles')
+    if not os.path.exists(tb_profiles_dir):
         return []
 
     accounts = []
@@ -100,7 +227,7 @@ def discover_thunderbird_accounts():
                     m = re.match(r'user_pref\("mail\.server\.(server\d+)\.(userName|hostname|directory|name)",\s*"([^"]+)"\);', line)
                     if m:
                         sid, key, val = m.groups()
-                        servers.setdefault(sid, {})[key] = val.replace('\\\\', os.sep).replace('\\', os.sep)
+                        servers.setdefault(sid, {})[key] = val.replace('\\\\', '\\')
 
             for sid, sdata in servers.items():
                 username = sdata.get('userName', '').strip()
@@ -139,7 +266,7 @@ def discover_thunderbird_accounts():
                     'type': 'thunderbird',
                     'hostname': hostname,
                     'directory': mbox_dir,
-                    'has_password': True,
+                    'has_password': True,  # Uses local synced mbox, no basic auth or app password needed!
                     'folders': folders
                 })
                 log_event("THUNDERBIRD", f"Found Thunderbird Account: {display_name} <{email_addr}> ({len(folders)} folders)")
@@ -147,6 +274,324 @@ def discover_thunderbird_accounts():
         log_event("THUNDERBIRD", f"Error scanning Thunderbird profiles: {e}", level="WARNING")
 
     return accounts
+
+
+# ==============================================================================
+# OUTLOOK COM MAPI ENGINE
+# ==============================================================================
+def is_outlook_configured():
+    """Checks Windows Registry to verify if an active email account is configured in Outlook."""
+    return False
+
+
+def get_outlook_namespace():
+    """Initializes COM and returns the Outlook MAPI namespace, if Outlook is configured."""
+    if not HAS_WIN32:
+        raise RuntimeError("pywin32 is not installed. Install via: pip install pywin32")
+    if not is_outlook_configured():
+        raise RuntimeError("No configured email accounts found in Microsoft Outlook profile.")
+    pythoncom.CoInitialize()
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+    except Exception:
+        outlook = win32com.client.gencache.EnsureDispatch("Outlook.Application")
+    return outlook.GetNamespace("MAPI")
+
+
+def get_sender_details(item):
+    """Extract clean sender email and display name from an Outlook MailItem."""
+    name = ""
+    email_addr = ""
+    try:
+        name = getattr(item, "SenderName", "") or ""
+    except Exception:
+        pass
+
+    try:
+        email_type = getattr(item, "SenderEmailType", "")
+        if email_type == "SMTP":
+            email_addr = getattr(item, "SenderEmailAddress", "") or ""
+        elif email_type == "EX":
+            try:
+                sender = getattr(item, "Sender", None)
+                if sender:
+                    ex_user = sender.GetExchangeUser()
+                    if ex_user:
+                        email_addr = getattr(ex_user, "PrimarySmtpAddress", "") or ""
+            except Exception:
+                pass
+
+            if not email_addr:
+                try:
+                    pa = item.PropertyAccessor
+                    email_addr = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x5D01001E")
+                except Exception:
+                    pass
+        else:
+            email_addr = getattr(item, "SenderEmailAddress", "") or ""
+    except Exception:
+        pass
+
+    if not email_addr:
+        try:
+            email_addr = getattr(item, "SenderEmailAddress", "") or ""
+        except Exception:
+            pass
+
+    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', email_addr)
+    if m:
+        clean_email = m.group(0).lower()
+    else:
+        m2 = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', name)
+        clean_email = m2.group(0).lower() if m2 else email_addr.lower()
+
+    return name, clean_email
+
+
+def get_mail_accounts():
+    """Discover all accounts from Classic Outlook COM, Windows auto-discovery, and saved IMAP."""
+    accounts = []
+    seen = set()
+    com_error = None
+    com_available = False
+
+    # 1. Auto-discover Mozilla Thunderbird accounts first (offline local storage ready)
+    tb_accounts = discover_thunderbird_accounts()
+    for acc in tb_accounts:
+        acc_key = acc['name'].lower()
+        if acc_key not in seen:
+            accounts.append(acc)
+            seen.add(acc_key)
+            if acc.get('email'):
+                seen.add(acc['email'].lower())
+
+    # 2. Try Classic Outlook COM
+    if HAS_WIN32:
+        try:
+            mapi = get_outlook_namespace()
+            com_available = True
+
+            for acc in mapi.Accounts:
+                name = acc.DisplayName
+                email_addr = getattr(acc, "SmtpAddress", "") or name
+                if name and name.lower() not in seen:
+                    accounts.append({
+                        "name": name,
+                        "username": name,
+                        "email": email_addr,
+                        "type": "outlook",
+                        "has_password": True,
+                        "folders": ["Inbox", "Junk Email", "Deleted Items", "Archive"]
+                    })
+                    seen.add(name.lower())
+                    seen.add(email_addr.lower())
+                    log_event("ACCOUNTS", f"Found Outlook MAPI Account: {name} <{email_addr}>")
+
+            for folder in mapi.Folders:
+                fname = folder.Name
+                if fname.lower() not in seen:
+                    subfolders = [f.Name for f in folder.Folders] or ["Inbox", "Junk Email"]
+                    accounts.append({
+                        "name": fname,
+                        "username": fname,
+                        "email": fname,
+                        "type": "outlook",
+                        "has_password": True,
+                        "folders": subfolders
+                    })
+                    seen.add(fname.lower())
+                    log_event("ACCOUNTS", f"Found Outlook Store Folder: {fname}")
+
+        except Exception as e:
+            err_str = str(e)
+            if "-2147221005" in err_str or "Invalid class string" in err_str:
+                com_error = "Classic Outlook COM not registered. 'New Outlook for Windows' (olk.exe) detected."
+                log_event("ACCOUNTS", com_error, level="INFO")
+            else:
+                com_error = f"Outlook COM error: {err_str}"
+                log_event("ACCOUNTS", com_error, level="WARNING")
+
+    # 3. Load saved configs
+    saved_imap = load_saved_accounts()
+    saved_by_email = {a.get('email', '').lower(): a for a in saved_imap if a.get('email')}
+
+    # 4. Auto-discover Windows Outlook / Live accounts
+    auto_accounts = discover_windows_email_accounts()
+    for acc in auto_accounts:
+        em = acc['email'].lower()
+        if em not in seen:
+            if em in saved_by_email:
+                saved = saved_by_email[em]
+                acc['has_password'] = True
+                acc['password'] = saved.get('password')
+                acc['host'] = saved.get('host', acc.get('host'))
+                acc['port'] = saved.get('port', acc.get('port'))
+                if saved.get('folders'):
+                    acc['folders'] = saved['folders']
+            else:
+                acc['has_password'] = False
+            accounts.append(acc)
+            seen.add(em)
+            seen.add(acc['name'].lower())
+            log_event("ACCOUNTS", f"Auto-discovered Windows Outlook account: {acc['name']} <{acc['email']}>")
+
+    # 5. Any other saved IMAP accounts
+    for acc in saved_imap:
+        em = acc.get('email', '').lower()
+        acc_name = acc.get('name') or em
+        if em not in seen and acc_name.lower() not in seen:
+            accounts.append({
+                "name": acc_name,
+                "username": acc.get("username", em),
+                "email": em,
+                "type": "imap",
+                "host": acc.get("host"),
+                "port": acc.get("port", 993),
+                "has_password": bool(acc.get("password")),
+                "folders": acc.get("folders", ["INBOX", "Junk", "Spam", "Archive", "Trash"])
+            })
+            seen.add(em)
+            seen.add(acc_name.lower())
+
+    log_event("ACCOUNTS", f"Accounts query complete. Total ready: {len(accounts)}")
+    return {
+        "accounts": accounts,
+        "com_available": com_available,
+        "com_error": com_error
+    }
+
+
+def get_target_folder(mapi, account_name, mailbox_name="Inbox"):
+    """Locate the target mailbox folder inside the specified Outlook account."""
+    target_root = None
+
+    if account_name:
+        clean_acc = account_name.strip().lower()
+        for f in mapi.Folders:
+            if f.Name.strip().lower() == clean_acc:
+                target_root = f
+                break
+        if not target_root:
+            for f in mapi.Folders:
+                if clean_acc in f.Name.lower() or f.Name.lower() in clean_acc:
+                    target_root = f
+                    break
+
+    if not target_root:
+        try:
+            target_root = mapi.GetDefaultFolder(6).Parent
+        except Exception:
+            if mapi.Folders.Count > 0:
+                target_root = mapi.Folders.Item(1)
+
+    if not target_root:
+        raise ValueError(f"Could not locate store for account '{account_name}'")
+
+    mb_lower = mailbox_name.strip().lower()
+
+    for sub in target_root.Folders:
+        if sub.Name.lower() == mb_lower:
+            return sub
+
+    for sub in target_root.Folders:
+        s_lower = sub.Name.lower()
+        if "inbox" in mb_lower and "inbox" in s_lower:
+            return sub
+        if ("all" in mb_lower or "mail" in mb_lower) and "all" in s_lower:
+            return sub
+        if ("junk" in mb_lower or "spam" in mb_lower) and ("junk" in s_lower or "spam" in s_lower):
+            return sub
+
+    if "inbox" in mb_lower:
+        return mapi.GetDefaultFolder(6)
+    elif "junk" in mb_lower or "spam" in mb_lower:
+        return mapi.GetDefaultFolder(23)
+
+    return target_root.Folders.Item(1)
+
+
+# ==============================================================================
+# HEADER & LINK PARSERS
+# ==============================================================================
+def parse_list_unsubscribe_headers(headers_str):
+    """Extract ALL unsubscribe endpoints from RFC 2369 & RFC 8058 headers."""
+    if not headers_str:
+        return None, None, False
+
+    http_url = None
+    mailto_url = None
+    is_one_click = False
+
+    m_unsub = re.search(r'List-Unsubscribe:\s*([^\r\n]+)', headers_str, re.I)
+    if m_unsub:
+        raw_val = m_unsub.group(1).strip()
+        urls = re.findall(r'<([^>]+)>', raw_val)
+        if not urls:
+            urls = [u.strip() for u in raw_val.split(',') if u.strip()]
+
+        for u in urls:
+            u_clean = u.strip()
+            if u_clean.lower().startswith('http') and not http_url:
+                http_url = u_clean
+            elif u_clean.lower().startswith('mailto:') and not mailto_url:
+                mailto_url = u_clean
+
+    if re.search(r'List-Unsubscribe-Post:\s*List-Unsubscribe=One-Click', headers_str, re.I):
+        is_one_click = True
+
+    return http_url, mailto_url, is_one_click
+
+
+def extract_web_unsubscribe_links(html_content):
+    """Scan HTML body for marketing unsubscribe and preference center links."""
+    links = []
+    if not html_content:
+        return links
+
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        text_pattern = re.compile(
+            r'unsubscribe|opt.?out|manage preferences|email preferences|email settings|'
+            r'subscription preferences|click here to stop|update your preferences|leave this list',
+            re.I
+        )
+        url_pattern = re.compile(r'unsubscribe|optout|opt_out|preferences|manage_subscriptions', re.I)
+
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            text = a.get_text().strip().lower()
+            if not href.startswith('http'):
+                continue
+            if text_pattern.search(text) or url_pattern.search(href):
+                if not any(k in href.lower() for k in ['privacy', 'terms', 'facebook.com', 'twitter.com', 'instagram.com']):
+                    links.append(href)
+    except Exception:
+        pass
+
+    seen = set()
+    deduped = []
+    for l in links:
+        if l not in seen:
+            seen.add(l)
+            deduped.append(l)
+    return deduped[:5]
+
+
+def decode_mime_header(header_val):
+    """Safely decode RFC 2047 MIME-encoded headers."""
+    if not header_val:
+        return ""
+    try:
+        parts = decode_header(header_val)
+        res = []
+        for text, enc in parts:
+            if isinstance(text, bytes):
+                res.append(text.decode(enc or 'utf-8', errors='ignore'))
+            else:
+                res.append(str(text))
+        return "".join(res)
+    except Exception:
+        return str(header_val)
 
 
 def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
@@ -167,6 +612,26 @@ def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
             if f.lower() == mb_clean or f.lower() == mailbox_name.lower():
                 return os.path.join(root, f)
 
+    return None
+
+
+def get_gloda_db_path():
+    """Locate Thunderbird's global-messages-db.sqlite."""
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        profiles_dir = os.path.join(appdata, 'Thunderbird', 'Profiles')
+        if os.path.exists(profiles_dir):
+            for d in os.listdir(profiles_dir):
+                candidate = os.path.join(profiles_dir, d, 'global-messages-db.sqlite')
+                if os.path.isfile(candidate):
+                    return candidate
+    home = os.path.expanduser('~')
+    mac_profiles = os.path.join(home, 'Library', 'Thunderbird', 'Profiles')
+    if os.path.exists(mac_profiles):
+        for d in os.listdir(mac_profiles):
+            candidate = os.path.join(mac_profiles, d, 'global-messages-db.sqlite')
+            if os.path.isfile(candidate):
+                return candidate
     return None
 
 
@@ -241,7 +706,9 @@ def scan_thunderbird_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
                     s_int = int(stat_val, 16)
                 except Exception:
                     s_int = 1
-                if s_int & 0x0008:
+                # In IMAP offline stores, 0x0009 represents Read messages (0x0001 | 0x0008).
+                # Only treat as deleted if flagged with 0x0008 without being an active status.
+                if s_int == 0x0008 or s_int == 0x000a:
                     continue
 
                 total_scanned += 1
@@ -305,213 +772,11 @@ def scan_thunderbird_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
 
 
 # ==============================================================================
-# CONFIG & IMAP STORAGE
-# ==============================================================================
-def load_saved_accounts():
-    """Load saved IMAP accounts from JSON configuration file."""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            log_event("ACCOUNTS", f"Failed to read {CONFIG_FILE}: {e}", level="WARNING")
-    return []
-
-
-def save_saved_accounts(accounts):
-    """Save IMAP accounts to JSON configuration file."""
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(accounts, f, indent=2)
-        return True
-    except Exception as e:
-        log_event("ACCOUNTS", f"Failed to save {CONFIG_FILE}: {e}", level="ERROR")
-        return False
-
-
-def test_imap_connection(host, port, username, password, use_ssl=True):
-    """Test IMAP credentials and return available folders."""
-    log_event("IMAP", f"Testing connection to {host}:{port} (SSL: {use_ssl}) for '{username}'...")
-    try:
-        if use_ssl:
-            client = imaplib.IMAP4_SSL(host, int(port), timeout=15)
-        else:
-            client = imaplib.IMAP4(host, int(port), timeout=15)
-
-        client.login(username, password)
-        status, folder_data = client.list()
-        folders = []
-        if status == 'OK':
-            for item in folder_data:
-                s = item.decode('utf-8', errors='ignore') if isinstance(item, bytes) else str(item)
-                m = re.search(r'\((?P<flags>[^\)]*)\)\s+\"(?P<delim>[^\"]+)\"\s+(?P<name>.+)', s)
-                if m:
-                    fname = m.group('name').strip(' "')
-                    folders.append(fname)
-                else:
-                    parts = s.split(' ')
-                    folders.append(parts[-1].strip(' "'))
-        client.logout()
-        log_event("IMAP", f"Connection successful! Found {len(folders)} folders.", level="SUCCESS")
-        return True, folders, "Connected successfully"
-    except Exception as e:
-        log_event("IMAP", f"Connection failed: {str(e)}", level="ERROR")
-        return False, [], str(e)
-
-
-# ==============================================================================
-# APPLE MAIL DISCOVERY
-# ==============================================================================
-def get_mail_accounts():
-    """Discover all accounts configured in Thunderbird, Apple Mail, and saved IMAP configs."""
-    accounts = []
-    seen = set()
-
-    # 1. Add Thunderbird accounts first (local offline storage ready)
-    tb_accounts = discover_thunderbird_accounts()
-    for acc in tb_accounts:
-        acc_key = acc['name'].lower()
-        if acc_key not in seen:
-            accounts.append(acc)
-            seen.add(acc_key)
-            if acc.get('email'):
-                seen.add(acc['email'].lower())
-
-    # 2. Query Apple Mail
-    cmd = """
-    tell application "Mail"
-        set accList to accounts
-        set res to {}
-        repeat with a in accList
-            set end of res to ((name of a) & "###" & (user name of a) & "###" & ((email addresses of a) as string))
-        end repeat
-        set AppleScript's text item delimiters to linefeed
-        return res as text
-    end tell
-    """
-    log_event("ACCOUNTS", "Discovering accounts configured in Apple Mail...")
-    try:
-        proc = subprocess.run(['osascript', '-e', cmd], capture_output=True, text=True, timeout=10)
-        if proc.returncode == 0:
-            for line in proc.stdout.splitlines():
-                if '###' in line:
-                    parts = line.split('###')
-                    acc_name = parts[0].strip()
-                    acc_email = parts[2].strip() if len(parts) > 2 else parts[1].strip()
-                    if acc_name.lower() not in seen:
-                        accounts.append({
-                            'name': acc_name,
-                            'username': parts[1].strip(),
-                            'email': acc_email,
-                            'type': 'applemail',
-                            'folders': ['Inbox', 'Junk', 'Trash', 'Archive']
-                        })
-                        seen.add(acc_name.lower())
-                        seen.add(acc_email.lower())
-                        log_event("ACCOUNTS", f"Found Apple Mail Account: {acc_name} <{acc_email}>")
-        else:
-            log_event("ACCOUNTS", f"AppleScript notice: {proc.stderr.strip()}", level="WARNING")
-    except Exception as e:
-        log_event("ACCOUNTS", f"Could not query Apple Mail: {e}", level="WARNING")
-
-    # 3. Add saved IMAP accounts
-    saved_imap = load_saved_accounts()
-    for acc in saved_imap:
-        acc_name = acc.get("name") or acc.get("email")
-        if acc_name.lower() not in seen:
-            accounts.append({
-                "name": acc_name,
-                "username": acc.get("username", acc.get("email")),
-                "email": acc.get("email"),
-                "type": "imap",
-                "host": acc.get("host"),
-                "port": acc.get("port", 993),
-                "folders": acc.get("folders", ["INBOX", "Junk", "Spam", "Archive", "Trash"])
-            })
-            seen.add(acc_name.lower())
-            seen.add(acc.get("email", "").lower())
-            log_event("ACCOUNTS", f"Loaded saved IMAP Account: {acc_name} ({acc.get('email')})")
-
-    return {
-        "accounts": accounts,
-        "com_available": True,
-        "com_error": None
-    }
-
-
-# ==============================================================================
-# HEADER & LINK PARSERS
-# ==============================================================================
-def parse_list_unsubscribe_headers(headers_str):
-    """Extract ALL unsubscribe endpoints from RFC 2369 & RFC 8058 headers."""
-    if not headers_str:
-        return None, None, False
-
-    http_url = None
-    mailto_url = None
-    is_one_click = False
-
-    m_unsub = re.search(r'List-Unsubscribe:\s*([^\r\n]+)', headers_str, re.I)
-    if m_unsub:
-        raw_val = m_unsub.group(1).strip()
-        urls = re.findall(r'<([^>]+)>', raw_val)
-        if not urls:
-            urls = [u.strip() for u in raw_val.split(',') if u.strip()]
-
-        for u in urls:
-            u_clean = u.strip()
-            if u_clean.lower().startswith('http') and not http_url:
-                http_url = u_clean
-            elif u_clean.lower().startswith('mailto:') and not mailto_url:
-                mailto_url = u_clean
-
-    if re.search(r'List-Unsubscribe-Post:\s*List-Unsubscribe=One-Click', headers_str, re.I):
-        is_one_click = True
-
-    return http_url, mailto_url, is_one_click
-
-
-def extract_web_unsubscribe_links(html_content):
-    """Scan HTML body for marketing unsubscribe and preference center links."""
-    links = []
-    if not html_content:
-        return links
-
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        text_pattern = re.compile(
-            r'unsubscribe|opt.?out|manage preferences|email preferences|email settings|'
-            r'subscription preferences|click here to stop|update your preferences|leave this list',
-            re.I
-        )
-        url_pattern = re.compile(r'unsubscribe|optout|opt_out|preferences|manage_subscriptions', re.I)
-
-        for a in soup.find_all('a', href=True):
-            href = a['href'].strip()
-            text = a.get_text().strip().lower()
-            if not href.startswith('http'):
-                continue
-            if text_pattern.search(text) or url_pattern.search(href):
-                if not any(k in href.lower() for k in ['privacy', 'terms', 'facebook.com', 'twitter.com', 'instagram.com']):
-                    links.append(href)
-    except Exception:
-        pass
-
-    seen = set()
-    deduped = []
-    for l in links:
-        if l not in seen:
-            seen.add(l)
-            deduped.append(l)
-    return deduped[:5]
-
-
-# ==============================================================================
 # SCANNING SUBSCRIPTIONS
 # ==============================================================================
 def scan_subscriptions(account_name, mailbox_name="Inbox", limit=0):
-    """Scan subscriptions from Thunderbird, Apple Mail or IMAP."""
-    log_event("SCAN", f"Starting scan for Account: '{account_name}', Folder: '{mailbox_name}', Limit: {limit}...")
+    """Smart scan across Thunderbird, Outlook COM or IMAP accounts."""
+    log_event("SCAN", f"Initiating scan for Account: '{account_name}', Folder: '{mailbox_name}', Limit: {limit}...")
 
     # 1. Check Thunderbird accounts first
     tb_accounts = discover_thunderbird_accounts()
@@ -519,128 +784,128 @@ def scan_subscriptions(account_name, mailbox_name="Inbox", limit=0):
     if tb_target:
         return scan_thunderbird_subscriptions(tb_target, mailbox_name, limit)
 
-    # 2. Check if IMAP account
-    saved = load_saved_accounts()
-    imap_cfg = next((a for a in saved if a.get('name') == account_name or a.get('email') == account_name), None)
-    if imap_cfg:
-        return scan_imap_subscriptions(imap_cfg, mailbox_name, limit)
+    # Check if this account is configured as IMAP or auto-discovered
+    saved_accounts = load_saved_accounts()
+    auto_accounts = discover_windows_email_accounts()
+    all_known = saved_accounts + auto_accounts
+    target_cfg = next((a for a in all_known if a.get('name') == account_name or a.get('email') == account_name), None)
 
-    # Apple Mail AppleScript scan
-    if limit > 0:
-        cmd = f"""
-        tell application "Mail"
-            set acc to account "{account_name}"
-            set mb to first mailbox of acc whose name is "{mailbox_name}"
-            set tot to count of messages of mb
-            if tot = 0 then return ""
-            set maxM to {limit}
-            if tot < maxM then set maxM to tot
-            
-            set res to {{}}
-            repeat with i from 1 to maxM
-                try
-                    set m to message i of mb
-                    set end of res to ((id of m as string) & "@@@" & (sender of m) & "@@@" & (subject of m))
-                end try
-            end repeat
-            set AppleScript's text item delimiters to linefeed
-            return res as text
-        end tell
-        """
-    else:
-        cmd = f"""
-        tell application "Mail"
-            set acc to account "{account_name}"
-            set mb to first mailbox of acc whose name is "{mailbox_name}"
-            set idList to id of every message of mb
-            set sList to sender of every message of mb
-            set subList to subject of every message of mb
-            
-            set res to {{}}
-            repeat with i from 1 to (count of idList)
-                set end of res to ((item i of idList as string) & "@@@" & (item i of sList) & "@@@" & (item i of subList))
-            end repeat
-            set AppleScript's text item delimiters to linefeed
-            return res as text
-        end tell
-        """
+    if target_cfg and (target_cfg.get('type') in ['imap', 'new_outlook'] or target_cfg.get('host')):
+        # Ensure password exists
+        if not target_cfg.get('password'):
+            saved_match = next((s for s in saved_accounts if s.get('email', '').lower() == target_cfg.get('email', '').lower()), None)
+            if saved_match and saved_match.get('password'):
+                target_cfg['password'] = saved_match['password']
+            else:
+                return {
+                    "error": f"Please open Mozilla Thunderbird and connect your '{target_cfg.get('email')}' account with 1-click browser sign-in.",
+                    "needs_password": False,
+                    "account": target_cfg.get("email"),
+                    "subscriptions": [],
+                    "total_scanned": 0
+                }
+        return scan_imap_subscriptions(target_cfg, mailbox_name, limit)
 
-    log_event("APPLEMAIL", f"Executing batch query in Apple Mail...")
-    proc = subprocess.run(['osascript', '-e', cmd], capture_output=True, text=True, timeout=90)
-    if proc.returncode != 0:
-        err = proc.stderr.strip()
-        log_event("APPLEMAIL", f"AppleScript error: {err}", level="ERROR")
-        return {"error": err, "subscriptions": [], "total_scanned": 0}
+    # Otherwise scan via Outlook COM
+    if not HAS_WIN32:
+        return {
+            "error": "pywin32 library is missing. Run 'pip install pywin32' on Windows, or use IMAP.",
+            "subscriptions": [],
+            "total_scanned": 0
+        }
 
-    lines = [l for l in proc.stdout.splitlines() if '@@@' in l]
-    total_scanned = len(lines)
-    log_event("APPLEMAIL", f"Retrieved {total_scanned} messages from mailbox.")
+    try:
+        mapi = get_outlook_namespace()
+        folder = get_target_folder(mapi, account_name, mailbox_name)
+    except Exception as e:
+        err_msg = str(e)
+        log_event("SCAN", f"Outlook access error: {err_msg}", level="ERROR")
+        return {"error": f"Failed to access Outlook: {err_msg}", "subscriptions": [], "total_scanned": 0}
+
+    items = folder.Items
+    total_items = items.Count
+    log_event("SCAN", f"Outlook folder '{folder.Name}' contains {total_items} total items.")
+
+    if total_items == 0:
+        return {"account": account_name, "mailbox": mailbox_name, "total_scanned": 0, "unique_domains": 0, "subscriptions": []}
+
+    try:
+        items.Sort("[ReceivedTime]", True)
+    except Exception:
+        pass
+
+    scan_depth = total_items
+    if limit > 0 and limit < total_items:
+        scan_depth = limit
 
     domain_msgs = defaultdict(list)
     domain_latest_meta = {}
+    total_scanned = 0
 
-    for line in lines:
-        parts = line.split('@@@')
-        mid = parts[0]
-        sender = parts[1]
-        subject = parts[2] if len(parts) > 2 else ""
+    log_event("SCAN", f"Reading up to {scan_depth} messages and grouping by sender domain...")
 
-        m_email = re.search(r'<([^>]+)>', sender)
-        email_addr = m_email.group(1).lower() if m_email else sender.lower()
-        dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
+    for i in range(1, scan_depth + 1):
+        try:
+            item = items.Item(i)
+            if getattr(item, "Class", 0) != 43 and not hasattr(item, "SenderEmailAddress"):
+                continue
 
-        domain_msgs[dom].append(mid)
-        if dom not in domain_latest_meta:
-            domain_latest_meta[dom] = {
-                "sample_mid": mid,
-                "sender": sender,
-                "subject": subject
-            }
+            entry_id = getattr(item, "EntryID", "")
+            if not entry_id:
+                continue
 
-    log_event("SCAN", f"Grouped into {len(domain_msgs)} unique sender domains.")
+            sender_name, sender_email = get_sender_details(item)
+            subject = getattr(item, "Subject", "") or ""
+
+            dom = sender_email.split('@')[-1] if '@' in sender_email else "unknown"
+            domain_msgs[dom].append(entry_id)
+            total_scanned += 1
+
+            if dom not in domain_latest_meta:
+                domain_latest_meta[dom] = {
+                    "entry_id": entry_id,
+                    "sender": f"{sender_name} <{sender_email}>" if sender_name else sender_email,
+                    "subject": subject
+                }
+        except Exception:
+            continue
+
+    log_event("SCAN", f"Sampled {total_scanned} emails across {len(domain_msgs)} unique sender domains.")
+
     sorted_domains = sorted(domain_msgs.keys(), key=lambda d: len(domain_msgs[d]), reverse=True)
-
     discovered = []
     inspection_limit = 100
-    log_event("SCAN", f"Inspecting headers and HTML bodies for top {min(len(sorted_domains), inspection_limit)} domains...")
+
+    log_event("SCAN", f"Inspecting top {min(len(sorted_domains), inspection_limit)} domains for unsubscribe links & RFC headers...")
 
     for dom in sorted_domains[:inspection_limit]:
         meta = domain_latest_meta[dom]
-        mid = meta["sample_mid"]
+        eid = meta["entry_id"]
 
-        fetch_cmd = f"""
-        tell application "Mail"
-            set acc to account "{account_name}"
-            set mb to first mailbox of acc whose name is "{mailbox_name}"
-            set m to (first message of mb whose id is {mid})
-            set h to (all headers of m)
-            set src to (source of m)
-            return h & "===SOURCE_SPLIT===" & src
-        end tell
-        """
-        proc_fetch = subprocess.run(['osascript', '-e', fetch_cmd], capture_output=True, text=True, timeout=12)
-        if proc_fetch.returncode != 0:
+        try:
+            sample_item = mapi.GetItemFromID(eid)
+        except Exception:
             continue
 
-        split_parts = proc_fetch.stdout.split("===SOURCE_SPLIT===")
-        headers_str = split_parts[0]
-        raw_source = split_parts[1] if len(split_parts) > 1 else ""
+        headers_str = ""
+        try:
+            pa = sample_item.PropertyAccessor
+            headers_str = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x007D001E") or ""
+        except Exception:
+            headers_str = ""
 
         http_unsub, mailto_unsub, is_one_click = parse_list_unsubscribe_headers(headers_str)
 
         web_links = []
-        if raw_source:
-            try:
-                msg = email.message_from_string(raw_source, policy=policy.default)
-                for part in msg.walk():
-                    if part.get_content_type() == 'text/html':
-                        web_links.extend(extract_web_unsubscribe_links(part.get_content()))
-            except Exception:
-                pass
+        try:
+            html_body = getattr(sample_item, "HTMLBody", "") or ""
+            web_links = extract_web_unsubscribe_links(html_body)
+        except Exception:
+            pass
 
         if http_unsub or mailto_unsub or web_links:
             discovered.append({
-                "message_id": mid,
+                "message_id": eid,
                 "domain": dom,
                 "email_count": len(domain_msgs[dom]),
                 "sender": meta["sender"],
@@ -649,10 +914,10 @@ def scan_subscriptions(account_name, mailbox_name="Inbox", limit=0):
                 "rfc_http": http_unsub,
                 "rfc_mailto": mailto_unsub,
                 "rfc_one_click": is_one_click,
-                "web_links": list(set(web_links))[:5]
+                "web_links": web_links
             })
 
-    log_event("SCAN", f"Scan finished! Discovered {len(discovered)} active marketing subscriptions.", level="SUCCESS")
+    log_event("SCAN", f"Scan complete! Discovered {len(discovered)} active subscriptions.", level="SUCCESS")
 
     return {
         "account": account_name,
@@ -665,7 +930,7 @@ def scan_subscriptions(account_name, mailbox_name="Inbox", limit=0):
 
 def scan_imap_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
     """Scan subscriptions using direct IMAP connection."""
-    host = account_cfg.get("host")
+    host = account_cfg.get("host", "outlook.office365.com")
     port = account_cfg.get("port", 993)
     username = account_cfg.get("username", account_cfg.get("email"))
     password = account_cfg.get("password")
@@ -673,7 +938,10 @@ def scan_imap_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
 
     log_event("IMAP", f"Connecting to IMAP {host}:{port} for {username}...")
     try:
-        client = imaplib.IMAP4_SSL(host, int(port), timeout=25) if use_ssl else imaplib.IMAP4(host, int(port), timeout=25)
+        if use_ssl:
+            client = imaplib.IMAP4_SSL(host, int(port), timeout=25)
+        else:
+            client = imaplib.IMAP4(host, int(port), timeout=25)
         client.login(username, password)
     except Exception as e:
         log_event("IMAP", f"IMAP connection failed: {e}", level="ERROR")
@@ -710,7 +978,8 @@ def scan_imap_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
             chunk = target_ids[i:i+batch_size]
             id_set = b','.join(chunk)
             status, fetch_data = client.fetch(id_set, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST DATE)])')
-            if status != 'OK': continue
+            if status != 'OK':
+                continue
 
             for item in fetch_data:
                 if isinstance(item, tuple):
@@ -719,6 +988,7 @@ def scan_imap_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
                         msg = email.message_from_string(raw_headers)
                         from_hdr = msg.get('From', '')
                         subj_hdr = msg.get('Subject', '')
+                        
                         m_email = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', from_hdr)
                         email_addr = m_email.group(0).lower() if m_email else "unknown"
                         dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
@@ -745,6 +1015,8 @@ def scan_imap_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
         sorted_domains = sorted(domain_msgs.keys(), key=lambda d: len(domain_msgs[d]), reverse=True)
         discovered = []
         inspection_limit = 100
+
+        log_event("IMAP", f"Fetching HTML bodies for top {min(len(sorted_domains), inspection_limit)} domains...")
 
         for dom in sorted_domains[:inspection_limit]:
             meta = domain_latest_meta[dom]
@@ -777,7 +1049,7 @@ def scan_imap_subscriptions(account_cfg, mailbox_name="INBOX", limit=0):
                 })
 
         client.logout()
-        log_event("IMAP", f"Scan finished! Found {len(discovered)} subscriptions.", level="SUCCESS")
+        log_event("IMAP", f"Scan finished! Found {len(discovered)} subscriptions across {len(domain_msgs)} domains.", level="SUCCESS")
 
         return {
             "account": account_cfg.get("name"),
@@ -814,15 +1086,13 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
     log_event("UNSUB", f"[{job_index}/{total_jobs}] Processing unsubscription for: '{domain}' (Sender: {sender})")
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Connection': 'close'
     }
 
-    # --------------------------------------------------------------------------
-    # Phase 1: RFC 8058 One-Click (HTTP POST)
-    # --------------------------------------------------------------------------
+    # 1. Phase 1: RFC 8058 One-Click
     if rfc_http and is_one_click:
         log_event("RFC", f"Attempting Phase 1: RFC 8058 One-Click POST to {rfc_http}...")
         try:
@@ -840,16 +1110,14 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
             else:
                 log_event("RFC", f"One-Click returned non-success code {r.status_code}. Falling back...", level="WARNING")
         except Exception as e:
-            log_event("RFC", f"One-Click failed: {e}. Falling back...", level="WARNING")
+            log_event("RFC", f"One-Click request failed: {e}. Falling back...", level="WARNING")
 
-    # --------------------------------------------------------------------------
-    # Phase 2: RFC 2369 Web GET
-    # --------------------------------------------------------------------------
+    # 2. Phase 2: RFC 2369 Web GET
     if rfc_http:
         log_event("RFC", f"Attempting Phase 2: RFC List-Unsubscribe GET to {rfc_http}...")
         try:
             r = requests.get(rfc_http, headers=headers, timeout=14, allow_redirects=True)
-            log_event("RFC", f"GET response HTTP {r.status_code}")
+            log_event("RFC", f"GET response HTTP {r.status_code} (Final URL: {r.url})")
             text_lower = r.text.lower()
             if r.status_code in [200, 202] and any(k in text_lower for k in [
                 "unsubscribed", "successfully removed", "opt-out confirmed", "preferences updated", "removed from our list"
@@ -863,43 +1131,34 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
         except Exception as e:
             log_event("RFC", f"RFC GET failed: {e}. Falling back...", level="WARNING")
 
-    # --------------------------------------------------------------------------
-    # Phase 3: RFC Mailto Unsubscribe via Apple Mail AppleScript
-    # --------------------------------------------------------------------------
+    # 3. Phase 3: RFC Mailto Unsubscribe Dispatch
     if rfc_mailto:
-        log_event("RFC", f"Attempting Phase 3: Inspecting mailto address: {rfc_mailto}")
+        log_event("RFC", f"Attempting Phase 3: Inspecting mailto unsubscribe address: {rfc_mailto}")
         parsed_mailto = urllib.parse.urlparse(rfc_mailto)
         recipient = parsed_mailto.path
         query_params = urllib.parse.parse_qs(parsed_mailto.query)
         unsub_subject = query_params.get('subject', ['Unsubscribe'])[0]
 
-        send_cmd = f"""
-        tell application "Mail"
-            set newMsg to make new outgoing message with properties {{subject:"{unsub_subject}", content:"Unsubscribe", visible:false}}
-            tell newMsg
-                make new to recipient with properties {{address:"{recipient}"}}
-                send
-            end tell
-        end tell
-        """
-        try:
-            log_event("APPLEMAIL", f"Dispatching unsubscribe email to '{recipient}' via Apple Mail...")
-            proc = subprocess.run(['osascript', '-e', send_cmd], capture_output=True, text=True, timeout=8)
-            if proc.returncode == 0:
-                log_event("UNSUB", f"✅ [SUCCESS] Sent unsubscribe email to {recipient} via Apple Mail!", level="SUCCESS")
+        if HAS_WIN32:
+            try:
+                log_event("OUTLOOK", f"Dispatching automated unsubscribe email to '{recipient}' via Outlook...")
+                mapi = get_outlook_namespace()
+                outlook = win32com.client.Dispatch("Outlook.Application")
+                mail_item = outlook.CreateItem(0)
+                mail_item.To = recipient
+                mail_item.Subject = unsub_subject
+                mail_item.Body = "Please unsubscribe me from this mailing list."
+                mail_item.Send()
+                log_event("UNSUB", f"✅ [SUCCESS] Sent unsubscribe email to {recipient} via Outlook!", level="SUCCESS")
                 return {
                     "success": True,
                     "method": "RFC Mailto Dispatched",
                     "details": f"Dispatched unsubscribe email to {recipient}"
                 }
-            else:
-                log_event("APPLEMAIL", f"Mail dispatch failed: {proc.stderr.strip()}", level="WARNING")
-        except Exception as e:
-            log_event("APPLEMAIL", f"Could not send email via Apple Mail: {e}", level="WARNING")
+            except Exception as e:
+                log_event("OUTLOOK", f"Could not send mailto via Outlook: {e}", level="WARNING")
 
-    # --------------------------------------------------------------------------
-    # Phase 4: Smart Web Form & Preference Center Solver
-    # --------------------------------------------------------------------------
+    # 4. Phase 4: Smart Web Form Solver
     candidate_urls = list(web_links)
     if rfc_http and rfc_http not in candidate_urls:
         candidate_urls.insert(0, rfc_http)
@@ -1009,9 +1268,7 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
             log_event("FORM", f"Error processing URL {url}: {e}", level="WARNING")
             continue
 
-    # --------------------------------------------------------------------------
-    # Phase 5: Real Chrome Headless Automation (Playwright on macOS)
-    # --------------------------------------------------------------------------
+    # 5. Phase 5: Headless Browser Execution (Handles JavaScript, React, Client-Side Forms)
     if HAS_PLAYWRIGHT and candidate_urls:
         target_url = candidate_urls[0]
         log_event("FORM", f"Attempting Phase 5: Real Chrome Headless Solver for '{domain}' at {target_url}...")
@@ -1022,6 +1279,7 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
                 page.goto(target_url, timeout=20000, wait_until="domcontentloaded")
                 time.sleep(2)
 
+                # Fill any email inputs
                 if target_email:
                     email_inputs = page.locator('input[type="email"], input[name*="email" i], input[id*="email" i]')
                     if email_inputs.count() > 0:
@@ -1031,6 +1289,7 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
                             except Exception:
                                 pass
 
+                # Look for "Unsubscribe from all" checkboxes or buttons
                 unsub_all_box = page.locator('input[type="checkbox"][id*="all" i], input[type="checkbox"][name*="all" i], label:has-text("Unsubscribe from all"), label:has-text("Opt-out of all")')
                 if unsub_all_box.count() > 0:
                     try:
@@ -1038,6 +1297,7 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
                     except Exception:
                         pass
 
+                # Click submit or unsubscribe button
                 btn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Unsubscribe"), button:has-text("Save"), button:has-text("Confirm"), button:has-text("Update")')
                 if btn.count() > 0:
                     btn.first.click(timeout=3000)
@@ -1056,9 +1316,7 @@ def execute_unsubscribe(target_email, sub_info, job_index=1, total_jobs=1):
         except Exception as e:
             log_event("FORM", f"Browser solver notice: {e}", level="INFO")
 
-    # --------------------------------------------------------------------------
-    # Phase 6: Manual Action Link
-    # --------------------------------------------------------------------------
+    # 6. Phase 6: Manual Action Link
     manual_link = candidate_urls[0] if candidate_urls else None
     log_event("UNSUB", f"⚠️ Automated methods exhausted for '{domain}'. Manual unsubscription link: {manual_link}", level="WARNING")
     return {
@@ -1112,7 +1370,7 @@ class UnsubHandler(http.server.SimpleHTTPRequestHandler):
         body = json.loads(raw_body) if raw_body else {}
 
         if parsed.path == '/api/imap/add':
-            host = body.get('host', '').strip()
+            host = body.get('host', 'outlook.office365.com').strip()
             port = body.get('port', 993)
             user = body.get('username', '').strip()
             pwd = body.get('password', '').strip()
@@ -1135,7 +1393,7 @@ class UnsubHandler(http.server.SimpleHTTPRequestHandler):
                     "folders": folders
                 })
                 save_saved_accounts(accounts)
-                res = {"success": True, "message": "IMAP account added and verified!", "folders": folders}
+                res = {"success": True, "message": "IMAP account connected successfully!", "folders": folders}
             else:
                 res = {"success": False, "message": msg}
 
@@ -1150,7 +1408,7 @@ class UnsubHandler(http.server.SimpleHTTPRequestHandler):
             accounts = load_saved_accounts()
             accounts = [a for a in accounts if a.get('email', '').lower() != email_addr.lower()]
             save_saved_accounts(accounts)
-            log_event("ACCOUNTS", f"Removed IMAP account '{email_addr}'")
+            log_event("ACCOUNTS", f"Removed saved credentials for '{email_addr}'")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1192,10 +1450,11 @@ class UnsubHandler(http.server.SimpleHTTPRequestHandler):
 
 def run():
     print("="*70, flush=True)
-    print("   🔕 UnsubBot (macOS Apple Mail & IMAP Engine)", flush=True)
+    print("   🔕 UnsubBot (Universal Outlook & IMAP Engine)", flush=True)
     print("="*70, flush=True)
-    log_event("INFO", f"Operating System: macOS ({sys.platform})")
-    log_event("INFO", f"Server running at http://localhost:{PORT}")
+    log_event("INFO", f"Operating System: Windows ({sys.platform})")
+    log_event("INFO", f"Classic Outlook COM (pywin32) Available: {HAS_WIN32}")
+    log_event("INFO", f"Server starting on http://localhost:{PORT}")
     print("="*70, flush=True)
 
     socketserver.TCPServer.allow_reuse_address = True

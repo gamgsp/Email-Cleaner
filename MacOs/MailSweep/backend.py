@@ -2,7 +2,6 @@ import http.server
 import socketserver
 import json
 import urllib.parse
-import subprocess
 import re
 import os
 import sys
@@ -19,6 +18,14 @@ from collections import Counter, defaultdict
 PORT = 7890
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts_config.json')
 
+# Check pywin32 availability
+try:
+    import win32com.client
+    import pythoncom
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
 
 def log_event(tag, message, level="INFO"):
     """Formatted, timestamped terminal logging with immediate flush."""
@@ -32,7 +39,7 @@ def log_event(tag, message, level="INFO"):
         "SCAN": "🔍",
         "ACCOUNTS": "📫",
         "IMAP": "🌐",
-        "APPLEMAIL": "🍎",
+        "OUTLOOK": "📧",
         "THUNDERBIRD": "🦅"
     }
     icon = icons.get(tag, icons.get(level, "• "))
@@ -54,304 +61,6 @@ def decode_mime_header(header_val):
         return "".join(res)
     except Exception:
         return str(header_val)
-
-
-# ==============================================================================
-# THUNDERBIRD ACCOUNT AUTO-DISCOVERY & MBOX ENGINE (Cross-Platform)
-# ==============================================================================
-def discover_thunderbird_accounts():
-    """Auto-discover email accounts and local mbox stores from Mozilla Thunderbird on macOS / Windows."""
-    candidates = [
-        os.path.expanduser('~/Library/Thunderbird/Profiles'),
-        os.path.expandvars(r'%APPDATA%\Thunderbird\Profiles'),
-        os.path.expanduser('~/.thunderbird')
-    ]
-    tb_profiles_dir = next((c for c in candidates if os.path.exists(c)), None)
-    if not tb_profiles_dir:
-        return []
-
-    accounts = []
-    seen = set()
-
-    try:
-        for prof in os.listdir(tb_profiles_dir):
-            prof_dir = os.path.join(tb_profiles_dir, prof)
-            prefs_file = os.path.join(prof_dir, 'prefs.js')
-            if not os.path.isfile(prefs_file):
-                continue
-
-            servers = {}
-            with open(prefs_file, 'r', encoding='latin-1') as f:
-                for line in f:
-                    line = line.strip()
-                    m = re.match(r'user_pref\("mail\.server\.(server\d+)\.(userName|hostname|directory|name)",\s*"([^"]+)"\);', line)
-                    if m:
-                        sid, key, val = m.groups()
-                        servers.setdefault(sid, {})[key] = val.replace('\\\\', os.sep).replace('\\', os.sep)
-
-            for sid, sdata in servers.items():
-                username = sdata.get('userName', '').strip()
-                if not username or username.lower() == 'nobody':
-                    continue
-
-                hostname = sdata.get('hostname', '')
-                mbox_dir = sdata.get('directory', '')
-                if not mbox_dir or not os.path.exists(mbox_dir):
-                    cand = os.path.join(prof_dir, 'ImapMail', hostname)
-                    if os.path.exists(cand):
-                        mbox_dir = cand
-
-                folders = []
-                if os.path.exists(mbox_dir):
-                    for root, dirs, files in os.walk(mbox_dir):
-                        for item in files:
-                            if not item.endswith('.msf') and not item.endswith('.dat'):
-                                rel = os.path.relpath(os.path.join(root, item), mbox_dir).replace('\\', '/')
-                                folders.append(rel)
-
-                if not folders:
-                    folders = ['INBOX', 'All Mail', 'Trash', 'Sent']
-
-                display_name = sdata.get('name') or username
-                acc_key = f"{username}@{hostname}".lower()
-                if acc_key in seen:
-                    continue
-                seen.add(acc_key)
-
-                email_addr = username if '@' in username else f"{username}@{hostname}"
-                accounts.append({
-                    'name': f"Thunderbird: {display_name}",
-                    'username': username,
-                    'email': email_addr,
-                    'type': 'thunderbird',
-                    'hostname': hostname,
-                    'directory': mbox_dir,
-                    'has_password': True,
-                    'folders': folders
-                })
-                log_event("THUNDERBIRD", f"Found Thunderbird Account: {display_name} <{email_addr}> ({len(folders)} folders)")
-    except Exception as e:
-        log_event("THUNDERBIRD", f"Error scanning Thunderbird profiles: {e}", level="WARNING")
-
-    return accounts
-
-
-def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
-    """Find the exact mbox file path, handling subdirectories like [Gmail].sbd/All Mail."""
-    if not mbox_dir or not os.path.exists(mbox_dir):
-        return None
-
-    norm_name = mailbox_name.replace('/', os.sep).replace('\\', os.sep)
-    direct = os.path.join(mbox_dir, norm_name)
-    if os.path.isfile(direct):
-        return direct
-
-    mb_clean = os.path.basename(mailbox_name).lower().strip()
-    for root, dirs, files in os.walk(mbox_dir):
-        for f in files:
-            if f.endswith('.msf') or f.endswith('.dat'):
-                continue
-            if f.lower() == mb_clean or f.lower() == mailbox_name.lower():
-                return os.path.join(root, f)
-
-    return None
-
-
-def scan_thunderbird_account(account_cfg, mailbox_name="INBOX"):
-    """Scan local Thunderbird mbox store for senders and domains using ultra-fast streaming."""
-    log_event("THUNDERBIRD", f"Scanning Thunderbird mailbox: '{account_cfg.get('name')}', Folder: '{mailbox_name}'...")
-    mbox_dir = account_cfg.get("directory", "")
-    if not mbox_dir or not os.path.exists(mbox_dir):
-        return {"error": f"Thunderbird directory not found: {mbox_dir}", "domains": []}
-
-    mbox_files_to_scan = []
-    if mailbox_name.strip().lower() in ["__all__", "full mailbox (all folders)", "all folders", "full mailbox"]:
-        # Scan all mbox files for this account
-        for root, dirs, files in os.walk(mbox_dir):
-            for item in files:
-                if not item.endswith('.msf') and not item.endswith('.dat'):
-                    mbox_files_to_scan.append(os.path.join(root, item))
-    else:
-        mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
-        if not mbox_path or not os.path.isfile(mbox_path):
-            return {"error": f"Mailbox file '{mailbox_name}' not found in Thunderbird storage.", "domains": []}
-        mbox_files_to_scan.append(mbox_path)
-
-    dom_counts = Counter()
-    dom_senders = defaultdict(lambda: Counter())
-    processed_count = 0
-
-    try:
-        for file_path in mbox_files_to_scan:
-            rel_name = os.path.relpath(file_path, mbox_dir).replace('\\', '/')
-            log_event("THUNDERBIRD", f"Reading Thunderbird storage file: '{rel_name}'...")
-            
-            with open(file_path, 'rb') as f:
-                current_status_val = b'0001'
-                current_from = ''
-                in_header = False
-
-                def commit_entry(from_str, status_val):
-                    nonlocal processed_count
-                    try:
-                        s_int = int(status_val, 16)
-                    except Exception:
-                        s_int = 1
-                    # Skip messages marked as deleted in Thunderbird (flag 0x0008)
-                    if s_int & 0x0008:
-                        return
-                    processed_count += 1
-                    name = ""
-                    email_addr = ""
-                    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', from_str)
-                    if m:
-                        email_addr = m.group(0).lower()
-                    name_match = re.match(r'^\"?([^\"<]+)\"?\s*<', from_str)
-                    if name_match:
-                        name = name_match.group(1).strip()
-                    if not email_addr:
-                        email_addr = from_str.lower()
-                    dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
-                    dom_counts[dom] += 1
-                    disp = f"{name} <{email_addr}>" if name else email_addr
-                    dom_senders[dom][disp] += 1
-
-                for line in f:
-                    if line.startswith(b'From - '):
-                        if in_header or current_from:
-                            commit_entry(current_from, current_status_val)
-                        current_status_val = b'0001'
-                        current_from = ''
-                        in_header = True
-                        continue
-
-                    if in_header:
-                        if line == b'\r\n' or line == b'\n':
-                            in_header = False
-                        elif line.startswith(b'X-Mozilla-Status:'):
-                            current_status_val = line[len(b'X-Mozilla-Status:'):].strip()
-                        elif line.lower().startswith(b'from:'):
-                            current_from = line[5:].decode('latin-1', errors='replace').strip()
-                        elif current_from and (line.startswith(b' ') or line.startswith(b'\t')):
-                            current_from += ' ' + line.decode('latin-1', errors='replace').strip()
-
-                if in_header or current_from:
-                    commit_entry(current_from, current_status_val)
-
-        categories = categorize_domains(dom_counts, dom_senders)
-        log_event("THUNDERBIRD", f"Scan complete! Classified {processed_count} messages across {len(dom_counts)} domains.", level="SUCCESS")
-
-        return {
-            "account": account_cfg.get("name"),
-            "mailbox": mailbox_name,
-            "total_messages": processed_count,
-            "total_domains": len(dom_counts),
-            "categories": categories
-        }
-    except Exception as e:
-        log_event("THUNDERBIRD", f"Error scanning mbox: {e}", level="ERROR")
-        return {"error": f"Failed reading Thunderbird mailbox: {e}", "domains": []}
-
-
-def delete_thunderbird_domains(account_cfg, mailbox_name, domains):
-    """Safely delete messages matching domains from local Thunderbird mbox store.
-    Uses ultra-fast in-place MAPI X-Mozilla-Status flag marking (0x0008 = MSG_FLAG_EXPUNGED),
-    which immediately expunges the emails in Thunderbird without file locking crashes."""
-    mbox_dir = account_cfg.get("directory", "")
-    if not mbox_dir or not os.path.exists(mbox_dir):
-        return {"success": False, "deleted_domains": 0, "errors": [f"Thunderbird directory not found: {mbox_dir}"]}
-
-    mbox_files_to_clean = []
-    if mailbox_name.strip().lower() in ["__all__", "full mailbox (all folders)", "all folders", "full mailbox"]:
-        for root, dirs, files in os.walk(mbox_dir):
-            for item in files:
-                if not item.endswith('.msf') and not item.endswith('.dat'):
-                    mbox_files_to_clean.append(os.path.join(root, item))
-    else:
-        mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
-        if not mbox_path or not os.path.isfile(mbox_path):
-            return {"success": False, "deleted_domains": 0, "errors": [f"Mailbox '{mailbox_name}' not found."]}
-        mbox_files_to_clean.append(mbox_path)
-
-    domains_set = set(d.lower().strip() for d in domains)
-    deleted_count = 0
-    errors = []
-
-    try:
-        for file_path in mbox_files_to_clean:
-            rel_name = os.path.relpath(file_path, mbox_dir).replace('\\', '/')
-            log_event("THUNDERBIRD", f"Expunging target domains from '{rel_name}'...")
-            
-            mark_entries = [] # (pos, new_bytes)
-            with open(file_path, 'rb') as f:
-                byte_offset = 0
-                current_status_pos = None
-                current_status_val = b'0001'
-                current_from = ''
-                in_header = False
-
-                for line in f:
-                    line_len = len(line)
-                    if line.startswith(b'From - '):
-                        if current_status_pos is not None and current_from:
-                            m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', current_from)
-                            ea = m.group(0).lower() if m else current_from.lower()
-                            dom = ea.split('@')[-1] if '@' in ea else ''
-                            if dom in domains_set or any(d in ea for d in domains_set):
-                                try:
-                                    val_int = int(current_status_val, 16)
-                                except Exception:
-                                    val_int = 1
-                                # 0x0008 = MSG_FLAG_EXPUNGED (deleted in Thunderbird)
-                                new_val = f'{val_int | 0x0008:04x}'.encode('ascii')
-                                mark_entries.append((current_status_pos, new_val))
-                                deleted_count += 1
-                        current_status_pos = None
-                        current_from = ''
-                        in_header = True
-                        byte_offset += line_len
-                        continue
-
-                    if in_header:
-                        if line == b'\r\n' or line == b'\n':
-                            in_header = False
-                        elif line.startswith(b'X-Mozilla-Status:'):
-                            current_status_pos = byte_offset + len(b'X-Mozilla-Status: ')
-                            current_status_val = line[len(b'X-Mozilla-Status: '):].strip()
-                        elif line.lower().startswith(b'from:'):
-                            current_from = line[5:].decode('latin-1', errors='replace').strip()
-                        elif current_from and (line.startswith(b' ') or line.startswith(b'\t')):
-                            current_from += ' ' + line.decode('latin-1', errors='replace').strip()
-
-                    byte_offset += line_len
-
-                # Check last message
-                if current_status_pos is not None and current_from:
-                    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', current_from)
-                    ea = m.group(0).lower() if m else current_from.lower()
-                    dom = ea.split('@')[-1] if '@' in ea else ''
-                    if dom in domains_set or any(d in ea for d in domains_set):
-                        try:
-                            val_int = int(current_status_val, 16)
-                        except Exception:
-                            val_int = 1
-                        new_val = f'{val_int | 0x0008:04x}'.encode('ascii')
-                        mark_entries.append((current_status_pos, new_val))
-                        deleted_count += 1
-
-            if mark_entries:
-                log_event("DELETE", f"Marking {len(mark_entries)} messages as deleted in '{rel_name}'...")
-                with open(file_path, 'r+b') as f:
-                    for pos, new_bytes in mark_entries:
-                        f.seek(pos)
-                        f.write(new_bytes)
-                    f.flush()
-
-        log_event("DELETE", f"COMPLETED: Deleted {deleted_count} messages across Thunderbird storage.", level="SUCCESS")
-        return {"success": True, "deleted_domains": len(domains), "deleted_count": deleted_count}
-    except Exception as e:
-        log_event("THUNDERBIRD", f"Error during deletion: {e}", level="ERROR")
-        return {"success": False, "deleted_domains": 0, "errors": [str(e)]}
 
 
 # ==============================================================================
@@ -410,14 +119,244 @@ def test_imap_connection(host, port, username, password, use_ssl=True):
 
 
 # ==============================================================================
-# APPLE MAIL DISCOVERY
+# AUTOMATIC WINDOWS ACCOUNT DISCOVERY (New Outlook / Live / Office)
 # ==============================================================================
-def get_mail_accounts():
-    """Discover all accounts configured in Thunderbird, Apple Mail, and saved IMAP configs."""
+def discover_windows_email_accounts():
+    """Auto-discover accounts from New Outlook (OneAuth), Substrate, and Windows Registry."""
     accounts = []
     seen = set()
 
-    # 1. Add Thunderbird accounts first (local offline storage)
+    oneauth_dir = os.path.expandvars(r'%LOCALAPPDATA%\Microsoft\OneAuth\accounts')
+    if os.path.exists(oneauth_dir):
+        for fname in os.listdir(oneauth_dir):
+            fpath = os.path.join(oneauth_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    email_addr = data.get('email') or data.get('login_name')
+                    disp_name = data.get('display_name') or email_addr
+                    if email_addr and email_addr.lower() not in seen:
+                        accounts.append({
+                            'name': disp_name,
+                            'username': email_addr,
+                            'email': email_addr,
+                            'type': 'new_outlook',
+                            'host': 'outlook.office365.com',
+                            'port': 993,
+                            'ssl': True,
+                            'folders': ['Inbox', 'Junk Email', 'Deleted Items', 'Archive']
+                        })
+                        seen.add(email_addr.lower())
+            except Exception:
+                pass
+
+    blobs_dir = os.path.expandvars(r'%LOCALAPPDATA%\Microsoft\OneAuth\blobs')
+    if os.path.exists(blobs_dir):
+        for fpath in glob.glob(os.path.join(blobs_dir, '*_substrate_profile')):
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    pdata = json.load(f)
+                    for em in pdata.get('emails', []):
+                        ea = em.get('emailAddress')
+                        if ea and ea.lower() not in seen:
+                            accounts.append({
+                                'name': f'Outlook ({ea})',
+                                'username': ea,
+                                'email': ea,
+                                'type': 'new_outlook',
+                                'host': 'outlook.office365.com',
+                                'port': 993,
+                                'ssl': True,
+                                'folders': ['Inbox', 'Junk Email', 'Deleted Items', 'Archive']
+                            })
+                            seen.add(ea.lower())
+            except Exception:
+                pass
+
+    try:
+        import winreg
+        key_path = r'Software\Microsoft\IdentityCRL\UserExtendedProperties'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            i = 0
+            while True:
+                try:
+                    subkey = winreg.EnumKey(key, i)
+                    if '@' in subkey and subkey.lower() not in seen:
+                        accounts.append({
+                            'name': f'Microsoft Account ({subkey})',
+                            'username': subkey,
+                            'email': subkey,
+                            'type': 'new_outlook',
+                            'host': 'outlook.office365.com',
+                            'port': 993,
+                            'ssl': True,
+                            'folders': ['Inbox', 'Junk Email', 'Deleted Items', 'Archive']
+                        })
+                        seen.add(subkey.lower())
+                    i += 1
+                except OSError:
+                    break
+    except Exception:
+        pass
+
+    return accounts
+
+
+# ==============================================================================
+# THUNDERBIRD ACCOUNT AUTO-DISCOVERY & MBOX ENGINE
+# ==============================================================================
+def discover_thunderbird_accounts():
+    """Auto-discover email accounts and local mbox stores from Mozilla Thunderbird."""
+    tb_profiles_dir = os.path.expandvars(r'%APPDATA%\Thunderbird\Profiles')
+    if not os.path.exists(tb_profiles_dir):
+        return []
+
+    accounts = []
+    seen = set()
+
+    try:
+        for prof in os.listdir(tb_profiles_dir):
+            prof_dir = os.path.join(tb_profiles_dir, prof)
+            prefs_file = os.path.join(prof_dir, 'prefs.js')
+            if not os.path.isfile(prefs_file):
+                continue
+
+            servers = {}
+            with open(prefs_file, 'r', encoding='latin-1') as f:
+                for line in f:
+                    line = line.strip()
+                    m = re.match(r'user_pref\("mail\.server\.(server\d+)\.(userName|hostname|directory|name)",\s*"([^"]+)"\);', line)
+                    if m:
+                        sid, key, val = m.groups()
+                        servers.setdefault(sid, {})[key] = val.replace('\\\\', '\\')
+
+            for sid, sdata in servers.items():
+                username = sdata.get('userName', '').strip()
+                if not username or username.lower() == 'nobody':
+                    continue
+
+                hostname = sdata.get('hostname', '')
+                mbox_dir = sdata.get('directory', '')
+                if not mbox_dir or not os.path.exists(mbox_dir):
+                    cand = os.path.join(prof_dir, 'ImapMail', hostname)
+                    if os.path.exists(cand):
+                        mbox_dir = cand
+
+                folders = []
+                if os.path.exists(mbox_dir):
+                    for root, dirs, files in os.walk(mbox_dir):
+                        for item in files:
+                            if not item.endswith('.msf') and not item.endswith('.dat'):
+                                rel = os.path.relpath(os.path.join(root, item), mbox_dir).replace('\\', '/')
+                                folders.append(rel)
+
+                if not folders:
+                    folders = ['INBOX', 'All Mail', 'Trash', 'Sent']
+
+                display_name = sdata.get('name') or username
+                acc_key = f"{username}@{hostname}".lower()
+                if acc_key in seen:
+                    continue
+                seen.add(acc_key)
+
+                email_addr = username if '@' in username else f"{username}@{hostname}"
+                accounts.append({
+                    'name': f"Thunderbird: {display_name}",
+                    'username': username,
+                    'email': email_addr,
+                    'type': 'thunderbird',
+                    'hostname': hostname,
+                    'directory': mbox_dir,
+                    'has_password': True,  # Uses local synced mbox, no basic auth or app password needed!
+                    'folders': folders
+                })
+                log_event("THUNDERBIRD", f"Found Thunderbird Account: {display_name} <{email_addr}> ({len(folders)} folders)")
+    except Exception as e:
+        log_event("THUNDERBIRD", f"Error scanning Thunderbird profiles: {e}", level="WARNING")
+
+    return accounts
+
+
+# ==============================================================================
+# OUTLOOK COM MAPI ENGINE
+# ==============================================================================
+def is_outlook_configured():
+    """Checks Windows Registry to verify if an active email account is configured in Outlook."""
+    return False
+
+
+def get_outlook_namespace():
+    """Initializes COM and returns the Outlook MAPI namespace, if Outlook is configured."""
+    if not HAS_WIN32:
+        raise RuntimeError("pywin32 is not installed. Install via: pip install pywin32")
+    if not is_outlook_configured():
+        raise RuntimeError("No configured email accounts found in Microsoft Outlook profile.")
+    pythoncom.CoInitialize()
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+    except Exception:
+        outlook = win32com.client.gencache.EnsureDispatch("Outlook.Application")
+    return outlook.GetNamespace("MAPI")
+
+
+def get_sender_details(item):
+    """Extract clean sender email and display name from an Outlook MailItem."""
+    name = ""
+    email_addr = ""
+    try:
+        name = getattr(item, "SenderName", "") or ""
+    except Exception:
+        pass
+
+    try:
+        email_type = getattr(item, "SenderEmailType", "")
+        if email_type == "SMTP":
+            email_addr = getattr(item, "SenderEmailAddress", "") or ""
+        elif email_type == "EX":
+            try:
+                sender = getattr(item, "Sender", None)
+                if sender:
+                    ex_user = sender.GetExchangeUser()
+                    if ex_user:
+                        email_addr = getattr(ex_user, "PrimarySmtpAddress", "") or ""
+            except Exception:
+                pass
+
+            if not email_addr:
+                try:
+                    pa = item.PropertyAccessor
+                    email_addr = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x5D01001E")
+                except Exception:
+                    pass
+        else:
+            email_addr = getattr(item, "SenderEmailAddress", "") or ""
+    except Exception:
+        pass
+
+    if not email_addr:
+        try:
+            email_addr = getattr(item, "SenderEmailAddress", "") or ""
+        except Exception:
+            pass
+
+    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', email_addr)
+    if m:
+        clean_email = m.group(0).lower()
+    else:
+        m2 = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', name)
+        clean_email = m2.group(0).lower() if m2 else email_addr.lower()
+
+    return name, clean_email
+
+
+def get_mail_accounts():
+    """Discover all accounts from Classic Outlook COM, Windows auto-discovery, and saved IMAP."""
+    accounts = []
+    seen = set()
+    com_error = None
+    com_available = False
+
+    # 1. Auto-discover Mozilla Thunderbird accounts first (offline local storage ready)
     tb_accounts = discover_thunderbird_accounts()
     for acc in tb_accounts:
         acc_key = acc['name'].lower()
@@ -427,66 +366,151 @@ def get_mail_accounts():
             if acc.get('email'):
                 seen.add(acc['email'].lower())
 
-    # 2. Query Apple Mail
-    cmd = """
-    tell application "Mail"
-        set accList to accounts
-        set res to {}
-        repeat with a in accList
-            set end of res to ((name of a) & "###" & (user name of a) & "###" & ((email addresses of a) as string))
-        end repeat
-        set AppleScript's text item delimiters to linefeed
-        return res as text
-    end tell
-    """
-    log_event("ACCOUNTS", "Discovering accounts configured in Apple Mail...")
-    try:
-        proc = subprocess.run(['osascript', '-e', cmd], capture_output=True, text=True, timeout=10)
-        if proc.returncode == 0:
-            for line in proc.stdout.splitlines():
-                if '###' in line:
-                    parts = line.split('###')
-                    acc_name = parts[0].strip()
-                    acc_email = parts[2].strip() if len(parts) > 2 else parts[1].strip()
-                    if acc_name.lower() not in seen:
-                        accounts.append({
-                            'name': acc_name,
-                            'username': parts[1].strip(),
-                            'email': acc_email,
-                            'type': 'applemail',
-                            'folders': ['Inbox', 'Junk', 'Trash', 'Archive']
-                        })
-                        seen.add(acc_name.lower())
-                        seen.add(acc_email.lower())
-                        log_event("ACCOUNTS", f"Found Apple Mail Account: {acc_name} <{acc_email}>")
-        else:
-            log_event("ACCOUNTS", f"AppleScript notice: {proc.stderr.strip()}", level="WARNING")
-    except Exception as e:
-        log_event("ACCOUNTS", f"Could not query Apple Mail: {e}", level="WARNING")
+    # 2. Check Classic Outlook COM
+    if HAS_WIN32:
+        try:
+            mapi = get_outlook_namespace()
+            com_available = True
 
-    # 3. Add saved IMAP accounts
+            for acc in mapi.Accounts:
+                name = acc.DisplayName
+                email_addr = getattr(acc, "SmtpAddress", "") or name
+                if name and name.lower() not in seen:
+                    accounts.append({
+                        "name": name,
+                        "username": name,
+                        "email": email_addr,
+                        "type": "outlook",
+                        "has_password": True,
+                        "folders": ["Inbox", "Junk Email", "Deleted Items", "Archive"]
+                    })
+                    seen.add(name.lower())
+                    seen.add(email_addr.lower())
+                    log_event("ACCOUNTS", f"Found Outlook MAPI Account: {name} <{email_addr}>")
+
+            for folder in mapi.Folders:
+                fname = folder.Name
+                if fname.lower() not in seen:
+                    subfolders = [f.Name for f in folder.Folders] or ["Inbox", "Junk Email"]
+                    accounts.append({
+                        "name": fname,
+                        "username": fname,
+                        "email": fname,
+                        "type": "outlook",
+                        "has_password": True,
+                        "folders": subfolders
+                    })
+                    seen.add(fname.lower())
+                    log_event("ACCOUNTS", f"Found Outlook Store Folder: {fname}")
+
+        except Exception as e:
+            err_str = str(e)
+            if "-2147221005" in err_str or "Invalid class string" in err_str:
+                com_error = "Classic Outlook COM is not registered. 'New Outlook for Windows' (olk.exe) detected."
+                log_event("ACCOUNTS", com_error, level="INFO")
+            else:
+                com_error = f"Outlook COM error: {err_str}"
+                log_event("ACCOUNTS", com_error, level="WARNING")
+
+    # 3. Load saved configs
     saved_imap = load_saved_accounts()
+    saved_by_email = {a.get('email', '').lower(): a for a in saved_imap if a.get('email')}
+
+    # 4. Auto-discover Windows Outlook / Live accounts
+    auto_accounts = discover_windows_email_accounts()
+    for acc in auto_accounts:
+        em = acc['email'].lower()
+        if em not in seen:
+            if em in saved_by_email:
+                saved = saved_by_email[em]
+                acc['has_password'] = True
+                acc['password'] = saved.get('password')
+                acc['host'] = saved.get('host', acc.get('host'))
+                acc['port'] = saved.get('port', acc.get('port'))
+                if saved.get('folders'):
+                    acc['folders'] = saved['folders']
+            else:
+                acc['has_password'] = False
+            accounts.append(acc)
+            seen.add(em)
+            seen.add(acc['name'].lower())
+            log_event("ACCOUNTS", f"Auto-discovered Windows Outlook account: {acc['name']} <{acc['email']}>")
+
+    # 5. Any other saved IMAP accounts
     for acc in saved_imap:
-        acc_name = acc.get("name") or acc.get("email")
-        if acc_name.lower() not in seen:
+        em = acc.get('email', '').lower()
+        acc_name = acc.get('name') or em
+        if em not in seen and acc_name.lower() not in seen:
             accounts.append({
                 "name": acc_name,
-                "username": acc.get("username", acc.get("email")),
-                "email": acc.get("email"),
+                "username": acc.get("username", em),
+                "email": em,
                 "type": "imap",
                 "host": acc.get("host"),
                 "port": acc.get("port", 993),
+                "has_password": bool(acc.get("password")),
                 "folders": acc.get("folders", ["INBOX", "Junk", "Spam", "Archive", "Trash"])
             })
+            seen.add(em)
             seen.add(acc_name.lower())
-            seen.add(acc.get("email", "").lower())
-            log_event("ACCOUNTS", f"Loaded saved IMAP Account: {acc_name} ({acc.get('email')})")
 
+    log_event("ACCOUNTS", f"Accounts query complete. Total ready: {len(accounts)}")
     return {
         "accounts": accounts,
-        "com_available": True,
-        "com_error": None
+        "com_available": com_available,
+        "com_error": com_error
     }
+
+
+def get_target_folder(mapi, account_name, mailbox_name="Inbox"):
+    """Locate the target mailbox folder inside the specified Outlook account."""
+    target_root = None
+
+    if account_name:
+        clean_acc = account_name.strip().lower()
+        for f in mapi.Folders:
+            if f.Name.strip().lower() == clean_acc:
+                target_root = f
+                break
+        if not target_root:
+            for f in mapi.Folders:
+                if clean_acc in f.Name.lower() or f.Name.lower() in clean_acc:
+                    target_root = f
+                    break
+
+    if not target_root:
+        try:
+            target_root = mapi.GetDefaultFolder(6).Parent
+        except Exception:
+            if mapi.Folders.Count > 0:
+                target_root = mapi.Folders.Item(1)
+
+    if not target_root:
+        raise ValueError(f"Could not locate store for account '{account_name}'")
+
+    mb_lower = mailbox_name.strip().lower()
+
+    for sub in target_root.Folders:
+        if sub.Name.lower() == mb_lower:
+            return sub
+
+    for sub in target_root.Folders:
+        s_lower = sub.Name.lower()
+        if "inbox" in mb_lower and "inbox" in s_lower:
+            return sub
+        if ("junk" in mb_lower or "spam" in mb_lower) and ("junk" in s_lower or "spam" in s_lower):
+            return sub
+        if ("trash" in mb_lower or "delete" in mb_lower) and ("trash" in s_lower or "deleted" in s_lower):
+            return sub
+
+    if "inbox" in mb_lower:
+        return mapi.GetDefaultFolder(6)
+    elif "junk" in mb_lower or "spam" in mb_lower:
+        return mapi.GetDefaultFolder(23)
+    elif "trash" in mb_lower or "delete" in mb_lower:
+        return mapi.GetDefaultFolder(3)
+
+    return target_root.Folders.Item(1)
 
 
 # ==============================================================================
@@ -600,8 +624,240 @@ def categorize_domains(dom_counts, dom_senders):
     return categories
 
 
+def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
+    """Find the exact mbox file path, handling subdirectories like [Gmail].sbd/All Mail."""
+    if not mbox_dir or not os.path.exists(mbox_dir):
+        return None
+
+    norm_name = mailbox_name.replace('/', os.sep).replace('\\', os.sep)
+    direct = os.path.join(mbox_dir, norm_name)
+    if os.path.isfile(direct):
+        return direct
+
+    # Search case-insensitively across all subdirectories
+    mb_clean = os.path.basename(mailbox_name).lower().strip()
+    for root, dirs, files in os.walk(mbox_dir):
+        for f in files:
+            if f.endswith('.msf') or f.endswith('.dat'):
+                continue
+            if f.lower() == mb_clean or f.lower() == mailbox_name.lower():
+                return os.path.join(root, f)
+
+    return None
+
+
+def get_gloda_db_path():
+    """Locate Thunderbird's global-messages-db.sqlite."""
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        profiles_dir = os.path.join(appdata, 'Thunderbird', 'Profiles')
+        if os.path.exists(profiles_dir):
+            for d in os.listdir(profiles_dir):
+                candidate = os.path.join(profiles_dir, d, 'global-messages-db.sqlite')
+                if os.path.isfile(candidate):
+                    return candidate
+    home = os.path.expanduser('~')
+    mac_profiles = os.path.join(home, 'Library', 'Thunderbird', 'Profiles')
+    if os.path.exists(mac_profiles):
+        for d in os.listdir(mac_profiles):
+            candidate = os.path.join(mac_profiles, d, 'global-messages-db.sqlite')
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def scan_thunderbird_gloda(account_cfg, mailbox_name="INBOX"):
+    """Query Thunderbird Gloda SQLite in read-only mode to retrieve 100% of messages and domains."""
+    db_path = get_gloda_db_path()
+    if not db_path or not os.path.isfile(db_path):
+        return None
+
+    email_addr = account_cfg.get('email', '') or account_cfg.get('username', '')
+    if not email_addr:
+        return None
+
+    import sqlite3
+    import urllib.parse
+    conn = None
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        c = conn.cursor()
+
+        id_map = dict(c.execute('SELECT id, value FROM identities').fetchall())
+        contact_names = dict(c.execute('SELECT id, name FROM contacts').fetchall())
+
+        encoded_email = urllib.parse.quote(email_addr)
+        folders = c.execute('SELECT id, folderURI FROM folderLocations WHERE folderURI LIKE ?', ('%' + encoded_email + '%',)).fetchall()
+        if not folders:
+            folders = c.execute('SELECT id, folderURI FROM folderLocations WHERE folderURI LIKE ?', ('%' + email_addr + '%',)).fetchall()
+
+        if not folders:
+            conn.close()
+            return None
+
+        is_all = mailbox_name.strip().lower() in ['__all__', 'full mailbox (all folders)', 'all folders', 'full mailbox', '']
+        if not is_all:
+            clean_folder = mailbox_name.strip().replace('/', '').replace('\\', '').lower()
+            matched = []
+            for fid, furi in folders:
+                tail = furi.rstrip('/').split('/')[-1].lower()
+                if tail == clean_folder or clean_folder in tail:
+                    matched.append((fid, furi))
+            if matched:
+                folders = matched
+
+        folder_ids = [f[0] for f in folders]
+        placeholders = ','.join('?' for _ in folder_ids)
+        q = f'SELECT m.id, c.subject, m.jsonAttributes, fl.folderURI FROM messages m LEFT JOIN conversations c ON m.conversationID = c.id LEFT JOIN folderLocations fl ON m.folderID = fl.id WHERE m.folderID IN ({placeholders}) AND m.deleted = 0'
+        rows = c.execute(q, folder_ids).fetchall()
+        conn.close()
+
+        if not rows:
+            return None
+
+        dom_counts = Counter()
+        dom_senders = defaultdict(lambda: Counter())
+
+        for mid, subj, attrs_str, furi in rows:
+            sender_email = 'unknown'
+            sender_name = ''
+            if attrs_str:
+                try:
+                    attrs = json.loads(attrs_str)
+                    fid = attrs.get('43')
+                    if fid in id_map:
+                        sender_email = id_map[fid].lower()
+                        if fid in contact_names and contact_names[fid]:
+                            sender_name = contact_names[fid]
+                except Exception:
+                    pass
+            dom = sender_email.split('@')[-1] if '@' in sender_email else 'unknown'
+            dom_counts[dom] += 1
+            disp = f"{sender_name} <{sender_email}>" if sender_name else sender_email
+            dom_senders[dom][disp] += 1
+
+        categories = categorize_domains(dom_counts, dom_senders)
+        log_event("THUNDERBIRD", f"Gloda scan complete! Classified {len(rows)} messages across {len(dom_counts)} domains.", level="SUCCESS")
+
+        return {
+            "account": account_cfg.get("name"),
+            "mailbox": mailbox_name,
+            "total_messages": len(rows),
+            "total_domains": len(dom_counts),
+            "categories": categories
+        }
+    except Exception as e:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+        log_event("THUNDERBIRD", f"Gloda SQLite scan fallback: {e}", level="WARNING")
+        return None
+
+
+def scan_thunderbird_account(account_cfg, mailbox_name="INBOX"):
+    """Scan local Thunderbird mbox store for senders and domains using ultra-fast streaming."""
+    log_event("THUNDERBIRD", f"Scanning Thunderbird mailbox: '{account_cfg.get('name')}', Folder: '{mailbox_name}'...")
+
+    # Primary: scan via Gloda SQLite index for complete mailbox coverage
+    gloda_res = scan_thunderbird_gloda(account_cfg, mailbox_name)
+    if gloda_res and gloda_res.get("total_messages", 0) > 0:
+        return gloda_res
+
+    mbox_dir = account_cfg.get("directory", "")
+    if not mbox_dir or not os.path.exists(mbox_dir):
+        return {"error": f"Thunderbird directory not found: {mbox_dir}", "domains": []}
+
+    mbox_files_to_scan = []
+    if mailbox_name.strip().lower() in ["__all__", "full mailbox (all folders)", "all folders", "full mailbox"]:
+        # Scan all mbox files for this account
+        for root, dirs, files in os.walk(mbox_dir):
+            for item in files:
+                if not item.endswith('.msf') and not item.endswith('.dat'):
+                    mbox_files_to_scan.append(os.path.join(root, item))
+    else:
+        mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
+        if not mbox_path or not os.path.isfile(mbox_path):
+            return {"error": f"Mailbox file '{mailbox_name}' not found in Thunderbird storage.", "domains": []}
+        mbox_files_to_scan.append(mbox_path)
+
+    dom_counts = Counter()
+    dom_senders = defaultdict(lambda: Counter())
+    processed_count = 0
+
+    try:
+        for file_path in mbox_files_to_scan:
+            rel_name = os.path.relpath(file_path, mbox_dir).replace('\\', '/')
+            log_event("THUNDERBIRD", f"Reading Thunderbird storage file: '{rel_name}'...")
+            
+            with open(file_path, 'rb') as f:
+                current_status_val = b'0001'
+                current_from = ''
+                in_header = False
+
+                def commit_entry(from_str, status_val):
+                    nonlocal processed_count
+                    try:
+                        s_int = int(status_val, 16)
+                    except Exception:
+                        s_int = 1
+                    # Skip messages marked as deleted in Thunderbird (flag 0x0008)
+                    if s_int & 0x0008:
+                        return
+                    processed_count += 1
+                    name = ""
+                    email_addr = ""
+                    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', from_str)
+                    if m:
+                        email_addr = m.group(0).lower()
+                    name_match = re.match(r'^\"?([^\"<]+)\"?\s*<', from_str)
+                    if name_match:
+                        name = name_match.group(1).strip()
+                    if not email_addr:
+                        email_addr = from_str.lower()
+                    dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
+                    dom_counts[dom] += 1
+                    disp = f"{name} <{email_addr}>" if name else email_addr
+                    dom_senders[dom][disp] += 1
+
+                for line in f:
+                    if line.startswith(b'From - '):
+                        if in_header or current_from:
+                            commit_entry(current_from, current_status_val)
+                        current_status_val = b'0001'
+                        current_from = ''
+                        in_header = True
+                        continue
+
+                    if in_header:
+                        if line == b'\r\n' or line == b'\n':
+                            in_header = False
+                        elif line.startswith(b'X-Mozilla-Status:'):
+                            current_status_val = line[len(b'X-Mozilla-Status:'):].strip()
+                        elif line.lower().startswith(b'from:'):
+                            current_from = line[5:].decode('latin-1', errors='replace').strip()
+                        elif current_from and (line.startswith(b' ') or line.startswith(b'\t')):
+                            current_from += ' ' + line.decode('latin-1', errors='replace').strip()
+
+                if in_header or current_from:
+                    commit_entry(current_from, current_status_val)
+
+        categories = categorize_domains(dom_counts, dom_senders)
+        log_event("THUNDERBIRD", f"Scan complete! Classified {processed_count} messages across {len(dom_counts)} domains.", level="SUCCESS")
+
+        return {
+            "account": account_cfg.get("name"),
+            "mailbox": mailbox_name,
+            "total_messages": processed_count,
+            "total_domains": len(dom_counts),
+            "categories": categories
+        }
+    except Exception as e:
+        log_event("THUNDERBIRD", f"Error scanning mbox: {e}", level="ERROR")
+        return {"error": f"Failed reading Thunderbird mailbox: {e}", "domains": []}
+
+
 def scan_account(account_name, mailbox_name="Inbox"):
-    """Fetch senders and domains from Thunderbird, Apple Mail or IMAP."""
+    """Fetch senders and domains from Thunderbird, Outlook COM or IMAP."""
     log_event("SCAN", f"Scanning Account: '{account_name}', Folder: '{mailbox_name}'...")
 
     # 1. Check Thunderbird accounts first
@@ -610,60 +866,72 @@ def scan_account(account_name, mailbox_name="Inbox"):
     if tb_target:
         return scan_thunderbird_account(tb_target, mailbox_name)
 
-    # 2. Check if IMAP account
-    saved = load_saved_accounts()
-    imap_cfg = next((a for a in saved if a.get('name') == account_name or a.get('email') == account_name), None)
-    if imap_cfg:
-        return scan_imap_account(imap_cfg, mailbox_name)
+    saved_accounts = load_saved_accounts()
+    auto_accounts = discover_windows_email_accounts()
+    all_known = saved_accounts + auto_accounts
+    target_cfg = next((a for a in all_known if a.get('name') == account_name or a.get('email') == account_name), None)
 
-    # Apple Mail AppleScript scan
-    cmd = f"""
-    tell application "Mail"
-        set acc to account "{account_name}"
-        set mb to first mailbox of acc whose name is "{mailbox_name}"
-        set sList to sender of every message of mb
-        set AppleScript's text item delimiters to linefeed
-        return sList as text
-    end tell
-    """
-    log_event("APPLEMAIL", f"Executing AppleScript to fetch senders from '{mailbox_name}'...")
-    proc = subprocess.run(['osascript', '-e', cmd], capture_output=True, text=True, timeout=60)
-    if proc.returncode != 0:
-        err = proc.stderr.strip()
-        log_event("APPLEMAIL", f"AppleScript error: {err}", level="ERROR")
-        return {"error": err, "domains": []}
+    if target_cfg and (target_cfg.get('type') in ['imap', 'new_outlook'] or target_cfg.get('host')):
+        if not target_cfg.get('password'):
+            saved_match = next((s for s in saved_accounts if s.get('email', '').lower() == target_cfg.get('email', '').lower()), None)
+            if saved_match and saved_match.get('password'):
+                target_cfg['password'] = saved_match['password']
+            else:
+                return {
+                    "error": f"Please open Mozilla Thunderbird and connect your '{target_cfg.get('email')}' account with 1-click browser sign-in.",
+                    "needs_password": False,
+                    "account": target_cfg.get("email"),
+                    "domains": []
+                }
+        return scan_imap_account(target_cfg, mailbox_name)
 
-    senders = [s for s in proc.stdout.splitlines() if s.strip()]
-    log_event("APPLEMAIL", f"Retrieved {len(senders)} message senders. Categorizing...")
+    if not HAS_WIN32:
+        return {
+            "error": "pywin32 library is missing. Run 'pip install pywin32' on Windows, or use IMAP.",
+            "domains": []
+        }
+
+    try:
+        mapi = get_outlook_namespace()
+        folder = get_target_folder(mapi, account_name, mailbox_name)
+    except Exception as e:
+        err_msg = str(e)
+        log_event("SCAN", f"Failed to access folder: {err_msg}", level="ERROR")
+        return {"error": f"Failed to access Outlook folder: {err_msg}", "domains": []}
+
+    items = folder.Items
+    total_items = items.Count
+    log_event("SCAN", f"Folder '{folder.Name}' contains {total_items} messages.")
 
     dom_counts = Counter()
     dom_senders = defaultdict(lambda: Counter())
+    processed_count = 0
 
-    for s in senders:
-        m = re.search(r'<([^>]+)>', s)
-        if m:
-            email_addr = m.group(1).lower()
-            name = s[:m.start()].strip(' "\'')
-        else:
-            m2 = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.\w+', s)
-            if m2:
-                email_addr = m2.group(0).lower()
-                name = s.replace(m2.group(0), '').strip(' <"\'()[]')
-            else:
-                email_addr = s.lower()
-                name = ""
-        dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
-        dom_counts[dom] += 1
-        disp = f"{name} <{email_addr}>" if name else email_addr
-        dom_senders[dom][disp] += 1
+    for i in range(1, total_items + 1):
+        try:
+            item = items.Item(i)
+            if getattr(item, "Class", 0) != 43 and not hasattr(item, "SenderEmailAddress"):
+                continue
+
+            name, email_addr = get_sender_details(item)
+            if not email_addr:
+                continue
+
+            processed_count += 1
+            dom = email_addr.split('@')[-1] if '@' in email_addr else "unknown"
+            dom_counts[dom] += 1
+            disp = f"{name} <{email_addr}>" if name else email_addr
+            dom_senders[dom][disp] += 1
+        except Exception:
+            continue
 
     categories = categorize_domains(dom_counts, dom_senders)
-    log_event("SCAN", f"Classified {len(senders)} messages across {len(dom_counts)} domains.", level="SUCCESS")
+    log_event("SCAN", f"Classified {processed_count} messages across {len(dom_counts)} domains.", level="SUCCESS")
 
     return {
         "account": account_name,
         "mailbox": mailbox_name,
-        "total_messages": len(senders),
+        "total_messages": processed_count,
         "total_domains": len(dom_counts),
         "categories": categories
     }
@@ -671,7 +939,7 @@ def scan_account(account_name, mailbox_name="Inbox"):
 
 def scan_imap_account(account_cfg, mailbox_name="INBOX"):
     """Scan IMAP mailbox for senders and domains."""
-    host = account_cfg.get("host")
+    host = account_cfg.get("host", "outlook.office365.com")
     port = account_cfg.get("port", 993)
     user = account_cfg.get("username", account_cfg.get("email"))
     pwd = account_cfg.get("password")
@@ -744,6 +1012,143 @@ def scan_imap_account(account_cfg, mailbox_name="INBOX"):
         return {"error": str(e), "domains": []}
 
 
+def delete_thunderbird_domains(account_cfg, mailbox_name, domains):
+    """Safely delete messages matching domains from local Thunderbird mbox store.
+    Uses ultra-fast in-place MAPI X-Mozilla-Status flag marking (0x0008 = MSG_FLAG_EXPUNGED),
+    which immediately expunges the emails in Thunderbird without file locking crashes."""
+    mbox_dir = account_cfg.get("directory", "")
+    if not mbox_dir or not os.path.exists(mbox_dir):
+        return {"success": False, "deleted_domains": 0, "errors": [f"Thunderbird directory not found: {mbox_dir}"]}
+
+    mbox_files_to_clean = []
+    if mailbox_name.strip().lower() in ["__all__", "full mailbox (all folders)", "all folders", "full mailbox"]:
+        for root, dirs, files in os.walk(mbox_dir):
+            for item in files:
+                if not item.endswith('.msf') and not item.endswith('.dat'):
+                    mbox_files_to_clean.append(os.path.join(root, item))
+    else:
+        mbox_path = resolve_thunderbird_mbox_path(mbox_dir, mailbox_name)
+        if not mbox_path or not os.path.isfile(mbox_path):
+            return {"success": False, "deleted_domains": 0, "errors": [f"Mailbox '{mailbox_name}' not found."]}
+        mbox_files_to_clean.append(mbox_path)
+
+    domains_set = set(d.lower().strip() for d in domains)
+    deleted_count = 0
+    errors = []
+
+    try:
+        for file_path in mbox_files_to_clean:
+            rel_name = os.path.relpath(file_path, mbox_dir).replace('\\', '/')
+            log_event("THUNDERBIRD", f"Expunging target domains from '{rel_name}'...")
+            
+            mark_entries = [] # (pos, new_bytes)
+            with open(file_path, 'rb') as f:
+                byte_offset = 0
+                current_status_pos = None
+                current_status_val = b'0001'
+                current_from = ''
+                in_header = False
+
+                for line in f:
+                    line_len = len(line)
+                    if line.startswith(b'From - '):
+                        if current_status_pos is not None and current_from:
+                            m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', current_from)
+                            ea = m.group(0).lower() if m else current_from.lower()
+                            dom = ea.split('@')[-1] if '@' in ea else ''
+                            if dom in domains_set or any(d in ea for d in domains_set):
+                                try:
+                                    val_int = int(current_status_val, 16)
+                                except Exception:
+                                    val_int = 1
+                                # 0x0008 = MSG_FLAG_EXPUNGED (deleted in Thunderbird)
+                                new_val = f'{val_int | 0x0008:04x}'.encode('ascii')
+                                mark_entries.append((current_status_pos, new_val))
+                                deleted_count += 1
+                        current_status_pos = None
+                        current_from = ''
+                        in_header = True
+                        byte_offset += line_len
+                        continue
+
+                    if in_header:
+                        if line == b'\r\n' or line == b'\n':
+                            in_header = False
+                        elif line.startswith(b'X-Mozilla-Status:'):
+                            current_status_pos = byte_offset + len(b'X-Mozilla-Status: ')
+                            current_status_val = line[len(b'X-Mozilla-Status: '):].strip()
+                        elif line.lower().startswith(b'from:'):
+                            current_from = line[5:].decode('latin-1', errors='replace').strip()
+                        elif current_from and (line.startswith(b' ') or line.startswith(b'\t')):
+                            current_from += ' ' + line.decode('latin-1', errors='replace').strip()
+
+                    byte_offset += line_len
+
+                # Check last message
+                if current_status_pos is not None and current_from:
+                    m = re.search(r'[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}', current_from)
+                    ea = m.group(0).lower() if m else current_from.lower()
+                    dom = ea.split('@')[-1] if '@' in ea else ''
+                    if dom in domains_set or any(d in ea for d in domains_set):
+                        try:
+                            val_int = int(current_status_val, 16)
+                        except Exception:
+                            val_int = 1
+                        new_val = f'{val_int | 0x0008:04x}'.encode('ascii')
+                        mark_entries.append((current_status_pos, new_val))
+                        deleted_count += 1
+
+            if mark_entries:
+                log_event("DELETE", f"Marking {len(mark_entries)} messages as deleted in '{rel_name}'...")
+                with open(file_path, 'r+b') as f:
+                    for pos, new_bytes in mark_entries:
+                        f.seek(pos)
+                        f.write(new_bytes)
+                    f.flush()
+
+            # Invalidate corresponding .msf index file so Thunderbird UI refreshes immediately
+            msf_file = file_path + '.msf'
+            if os.path.isfile(msf_file):
+                try:
+                    os.remove(msf_file)
+                    log_event("DELETE", f"Purged index cache '{os.path.basename(msf_file)}' for UI refresh.")
+                except Exception:
+                    pass
+
+        # Update Thunderbird Gloda SQLite index (deleted = 1)
+        db_path = get_gloda_db_path()
+        if db_path and os.path.isfile(db_path):
+            try:
+                import sqlite3
+                import urllib.parse
+                email_addr = account_cfg.get('email', '') or account_cfg.get('username', '')
+                conn = sqlite3.connect(db_path)
+                c = conn.cursor()
+                id_map = dict(c.execute('SELECT id, value FROM identities').fetchall())
+                target_identity_ids = [fid for fid, val in id_map.items() if any(d in val.lower() for d in domains_set)]
+                if target_identity_ids:
+                    # Mark messages as deleted in Gloda
+                    encoded_email = urllib.parse.quote(email_addr)
+                    folder_rows = c.execute('SELECT id FROM folderLocations WHERE folderURI LIKE ? OR folderURI LIKE ?', 
+                                            ('%' + encoded_email + '%', '%' + email_addr + '%')).fetchall()
+                    if folder_rows:
+                        fids = [r[0] for r in folder_rows]
+                        placeholders = ','.join('?' for _ in fids)
+                        for tid in target_identity_ids:
+                            c.execute(f"UPDATE messages SET deleted = 1 WHERE folderID IN ({placeholders}) AND jsonAttributes LIKE ?", 
+                                      fids + [f'%"{tid}"%'])
+                    conn.commit()
+                conn.close()
+            except Exception as ge:
+                log_event("DELETE", f"Gloda database update warning: {ge}", level="WARNING")
+
+        log_event("DELETE", f"COMPLETED: Deleted {deleted_count} messages across Thunderbird storage.", level="SUCCESS")
+        return {"success": True, "deleted_domains": len(domains), "deleted_count": deleted_count}
+    except Exception as e:
+        log_event("THUNDERBIRD", f"Error during deletion: {e}", level="ERROR")
+        return {"success": False, "deleted_domains": 0, "errors": [str(e)]}
+
+
 # ==============================================================================
 # DELETING DOMAINS
 # ==============================================================================
@@ -760,59 +1165,67 @@ def delete_domains(account_name, mailbox_name, domains):
     if tb_target:
         return delete_thunderbird_domains(tb_target, mailbox_name, domains)
 
-    # 2. Check if IMAP account
-    saved = load_saved_accounts()
-    imap_cfg = next((a for a in saved if a.get('name') == account_name or a.get('email') == account_name), None)
-    if imap_cfg:
-        return delete_imap_domains(imap_cfg, mailbox_name, domains)
+    saved_accounts = load_saved_accounts()
+    auto_accounts = discover_windows_email_accounts()
+    all_known = saved_accounts + auto_accounts
+    target_cfg = next((a for a in all_known if a.get('name') == account_name or a.get('email') == account_name), None)
 
-    # Apple Mail AppleScript Batch Deletion
-    batch_size = 12
-    batches = [domains[i:i + batch_size] for i in range(0, len(domains), batch_size)]
+    if target_cfg and (target_cfg.get('type') in ['imap', 'new_outlook'] or target_cfg.get('host')):
+        if not target_cfg.get('password'):
+            saved_match = next((s for s in saved_accounts if s.get('email', '').lower() == target_cfg.get('email', '').lower()), None)
+            if saved_match and saved_match.get('password'):
+                target_cfg['password'] = saved_match['password']
+        return delete_imap_domains(target_cfg, mailbox_name, domains)
+
+    if not HAS_WIN32:
+        return {"success": False, "deleted_domains": 0, "errors": ["pywin32 is not installed."]}
+
+    try:
+        mapi = get_outlook_namespace()
+        folder = get_target_folder(mapi, account_name, mailbox_name)
+    except Exception as e:
+        log_event("DELETE", f"Access error: {e}", level="ERROR")
+        return {"success": False, "deleted_domains": 0, "errors": [str(e)]}
+
+    items = folder.Items
+    total_items = items.Count
+    domains_set = set(d.lower().strip() for d in domains)
     deleted_count = 0
     errors = []
 
-    for idx, b in enumerate(batches, 1):
-        conditions = " or ".join([f'sender contains "{d}"' for d in b])
-        cmd = f"""
-        tell application "Mail"
-            set acc to account "{account_name}"
-            set mb to first mailbox of acc whose name is "{mailbox_name}"
-            set msgs to (messages of mb whose {conditions})
-            set c to count of msgs
-            delete msgs
-            return c
-        end tell
-        """
-        log_event("APPLEMAIL", f"Executing Batch {idx}/{len(batches)} (Domains: {b})...")
-        proc = subprocess.run(['osascript', '-e', cmd], capture_output=True, text=True, timeout=45)
-        if proc.returncode == 0:
-            try:
-                batch_del = int(proc.stdout.strip())
-                deleted_count += batch_del
-                log_event("DELETE", f"Batch {idx} deleted {batch_del} messages.")
-            except Exception:
-                pass
-        else:
-            err = proc.stderr.strip()
-            log_event("APPLEMAIL", f"Batch {idx} error: {err}", level="WARNING")
-            errors.append(err)
+    log_event("DELETE", f"Scanning {total_items} items in folder '{folder.Name}' for matches...")
 
+    for i in range(total_items, 0, -1):
+        try:
+            item = items.Item(i)
+            name, email_addr = get_sender_details(item)
+            dom = email_addr.split('@')[-1] if '@' in email_addr else ""
+            if dom.lower() in domains_set or any(d in email_addr for d in domains_set):
+                subj = getattr(item, "Subject", "") or "No Subject"
+                item.Delete()
+                deleted_count += 1
+                if deleted_count <= 10 or deleted_count % 25 == 0:
+                    log_event("DELETE", f"Deleted #{deleted_count}: [{dom}] '{subj[:40]}'")
+        except Exception as e:
+            errors.append(str(e))
+
+    remaining = folder.Items.Count
     print("="*70, flush=True)
-    log_event("DELETE", f"COMPLETED: Deleted {deleted_count} messages across {len(domains)} domains.", level="SUCCESS")
+    log_event("DELETE", f"COMPLETED: Deleted {deleted_count} messages matching {len(domains)} domains. Remaining in folder: {remaining}", level="SUCCESS")
     print("="*70 + "\n", flush=True)
 
     return {
         "success": len(errors) == 0,
         "deleted_domains": len(domains),
         "deleted_count": deleted_count,
+        "new_count": remaining,
         "errors": errors[:10]
     }
 
 
 def delete_imap_domains(account_cfg, mailbox_name, domains):
     """Delete messages matching domains via IMAP."""
-    host = account_cfg.get("host")
+    host = account_cfg.get("host", "outlook.office365.com")
     port = account_cfg.get("port", 993)
     user = account_cfg.get("username", account_cfg.get("email"))
     pwd = account_cfg.get("password")
@@ -909,7 +1322,7 @@ class CleanerHandler(http.server.SimpleHTTPRequestHandler):
         body = json.loads(raw_body) if raw_body else {}
 
         if parsed.path == '/api/imap/add':
-            host = body.get('host', '').strip()
+            host = body.get('host', 'outlook.office365.com').strip()
             port = body.get('port', 993)
             user = body.get('username', '').strip()
             pwd = body.get('password', '').strip()
@@ -932,7 +1345,7 @@ class CleanerHandler(http.server.SimpleHTTPRequestHandler):
                     "folders": folders
                 })
                 save_saved_accounts(accounts)
-                res = {"success": True, "message": "IMAP account added and verified!", "folders": folders}
+                res = {"success": True, "message": "IMAP account connected successfully!", "folders": folders}
             else:
                 res = {"success": False, "message": msg}
 
@@ -947,7 +1360,7 @@ class CleanerHandler(http.server.SimpleHTTPRequestHandler):
             accounts = load_saved_accounts()
             accounts = [a for a in accounts if a.get('email', '').lower() != email_addr.lower()]
             save_saved_accounts(accounts)
-            log_event("ACCOUNTS", f"Removed IMAP account '{email_addr}'")
+            log_event("ACCOUNTS", f"Removed credentials for '{email_addr}'")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -970,10 +1383,11 @@ class CleanerHandler(http.server.SimpleHTTPRequestHandler):
 
 def run():
     print("="*70, flush=True)
-    print("   🧹 MailSweep (macOS Apple Mail & IMAP Cleaner)", flush=True)
+    print("   🧹 MailSweep (Universal Outlook & IMAP Cleaner)", flush=True)
     print("="*70, flush=True)
-    log_event("INFO", f"Operating System: macOS ({sys.platform})")
-    log_event("INFO", f"Server running at http://localhost:{PORT}")
+    log_event("INFO", f"Operating System: Windows ({sys.platform})")
+    log_event("INFO", f"Classic Outlook COM (pywin32) Available: {HAS_WIN32}")
+    log_event("INFO", f"Server starting on http://localhost:{PORT}")
     print("="*70, flush=True)
 
     socketserver.TCPServer.allow_reuse_address = True

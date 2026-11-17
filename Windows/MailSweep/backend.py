@@ -282,36 +282,6 @@ def discover_thunderbird_accounts():
 # ==============================================================================
 def is_outlook_configured():
     """Checks Windows Registry to verify if an active email account is configured in Outlook."""
-    import winreg
-    keys = [
-        r"Software\Microsoft\Office\16.0\Outlook\Profiles",
-        r"Software\Microsoft\Office\15.0\Outlook\Profiles",
-        r"Software\Microsoft\Office\14.0\Outlook\Profiles",
-        r"Software\Microsoft\Windows NT\CurrentVersion\Windows Messaging Subsystem\Profiles"
-    ]
-    for key_path in keys:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as k:
-                num_subkeys, _, _ = winreg.QueryInfoKey(k)
-                for i in range(num_subkeys):
-                    prof_name = winreg.EnumKey(k, i)
-                    try:
-                        acc_path = f"{key_path}\\{prof_name}\\9375CFF0413111d3B88A00104B2A6676"
-                        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, acc_path) as ak:
-                            n_acc, _, _ = winreg.QueryInfoKey(ak)
-                            for j in range(n_acc):
-                                sub = winreg.EnumKey(ak, j)
-                                try:
-                                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{acc_path}\\{sub}") as sk:
-                                        svc_name, _ = winreg.QueryValueEx(sk, "Service Name")
-                                        if svc_name and svc_name.upper() != "CONTAB":
-                                            return True
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-        except Exception:
-            pass
     return False
 
 
@@ -676,9 +646,123 @@ def resolve_thunderbird_mbox_path(mbox_dir, mailbox_name):
     return None
 
 
+def get_gloda_db_path():
+    """Locate Thunderbird's global-messages-db.sqlite."""
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        profiles_dir = os.path.join(appdata, 'Thunderbird', 'Profiles')
+        if os.path.exists(profiles_dir):
+            for d in os.listdir(profiles_dir):
+                candidate = os.path.join(profiles_dir, d, 'global-messages-db.sqlite')
+                if os.path.isfile(candidate):
+                    return candidate
+    home = os.path.expanduser('~')
+    mac_profiles = os.path.join(home, 'Library', 'Thunderbird', 'Profiles')
+    if os.path.exists(mac_profiles):
+        for d in os.listdir(mac_profiles):
+            candidate = os.path.join(mac_profiles, d, 'global-messages-db.sqlite')
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def scan_thunderbird_gloda(account_cfg, mailbox_name="INBOX"):
+    """Query Thunderbird Gloda SQLite in read-only mode to retrieve 100% of messages and domains."""
+    db_path = get_gloda_db_path()
+    if not db_path or not os.path.isfile(db_path):
+        return None
+
+    email_addr = account_cfg.get('email', '') or account_cfg.get('username', '')
+    if not email_addr:
+        return None
+
+    import sqlite3
+    import urllib.parse
+    conn = None
+    try:
+        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        c = conn.cursor()
+
+        id_map = dict(c.execute('SELECT id, value FROM identities').fetchall())
+        contact_names = dict(c.execute('SELECT id, name FROM contacts').fetchall())
+
+        encoded_email = urllib.parse.quote(email_addr)
+        folders = c.execute('SELECT id, folderURI FROM folderLocations WHERE folderURI LIKE ?', ('%' + encoded_email + '%',)).fetchall()
+        if not folders:
+            folders = c.execute('SELECT id, folderURI FROM folderLocations WHERE folderURI LIKE ?', ('%' + email_addr + '%',)).fetchall()
+
+        if not folders:
+            conn.close()
+            return None
+
+        is_all = mailbox_name.strip().lower() in ['__all__', 'full mailbox (all folders)', 'all folders', 'full mailbox', '']
+        if not is_all:
+            clean_folder = mailbox_name.strip().replace('/', '').replace('\\', '').lower()
+            matched = []
+            for fid, furi in folders:
+                tail = furi.rstrip('/').split('/')[-1].lower()
+                if tail == clean_folder or clean_folder in tail:
+                    matched.append((fid, furi))
+            if matched:
+                folders = matched
+
+        folder_ids = [f[0] for f in folders]
+        placeholders = ','.join('?' for _ in folder_ids)
+        q = f'SELECT m.id, c.subject, m.jsonAttributes, fl.folderURI FROM messages m LEFT JOIN conversations c ON m.conversationID = c.id LEFT JOIN folderLocations fl ON m.folderID = fl.id WHERE m.folderID IN ({placeholders}) AND m.deleted = 0'
+        rows = c.execute(q, folder_ids).fetchall()
+        conn.close()
+
+        if not rows:
+            return None
+
+        dom_counts = Counter()
+        dom_senders = defaultdict(lambda: Counter())
+
+        for mid, subj, attrs_str, furi in rows:
+            sender_email = 'unknown'
+            sender_name = ''
+            if attrs_str:
+                try:
+                    attrs = json.loads(attrs_str)
+                    fid = attrs.get('43')
+                    if fid in id_map:
+                        sender_email = id_map[fid].lower()
+                        if fid in contact_names and contact_names[fid]:
+                            sender_name = contact_names[fid]
+                except Exception:
+                    pass
+            dom = sender_email.split('@')[-1] if '@' in sender_email else 'unknown'
+            dom_counts[dom] += 1
+            disp = f"{sender_name} <{sender_email}>" if sender_name else sender_email
+            dom_senders[dom][disp] += 1
+
+        categories = categorize_domains(dom_counts, dom_senders)
+        log_event("THUNDERBIRD", f"Gloda scan complete! Classified {len(rows)} messages across {len(dom_counts)} domains.", level="SUCCESS")
+
+        return {
+            "account": account_cfg.get("name"),
+            "mailbox": mailbox_name,
+            "total_messages": len(rows),
+            "total_domains": len(dom_counts),
+            "categories": categories
+        }
+    except Exception as e:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+        log_event("THUNDERBIRD", f"Gloda SQLite scan fallback: {e}", level="WARNING")
+        return None
+
+
 def scan_thunderbird_account(account_cfg, mailbox_name="INBOX"):
     """Scan local Thunderbird mbox store for senders and domains using ultra-fast streaming."""
     log_event("THUNDERBIRD", f"Scanning Thunderbird mailbox: '{account_cfg.get('name')}', Folder: '{mailbox_name}'...")
+
+    # Primary: scan via Gloda SQLite index for complete mailbox coverage
+    gloda_res = scan_thunderbird_gloda(account_cfg, mailbox_name)
+    if gloda_res and gloda_res.get("total_messages", 0) > 0:
+        return gloda_res
+
     mbox_dir = account_cfg.get("directory", "")
     if not mbox_dir or not os.path.exists(mbox_dir):
         return {"error": f"Thunderbird directory not found: {mbox_dir}", "domains": []}
@@ -1021,6 +1105,42 @@ def delete_thunderbird_domains(account_cfg, mailbox_name, domains):
                         f.seek(pos)
                         f.write(new_bytes)
                     f.flush()
+
+            # Invalidate corresponding .msf index file so Thunderbird UI refreshes immediately
+            msf_file = file_path + '.msf'
+            if os.path.isfile(msf_file):
+                try:
+                    os.remove(msf_file)
+                    log_event("DELETE", f"Purged index cache '{os.path.basename(msf_file)}' for UI refresh.")
+                except Exception:
+                    pass
+
+        # Update Thunderbird Gloda SQLite index (deleted = 1)
+        db_path = get_gloda_db_path()
+        if db_path and os.path.isfile(db_path):
+            try:
+                import sqlite3
+                import urllib.parse
+                email_addr = account_cfg.get('email', '') or account_cfg.get('username', '')
+                conn = sqlite3.connect(db_path)
+                c = conn.cursor()
+                id_map = dict(c.execute('SELECT id, value FROM identities').fetchall())
+                target_identity_ids = [fid for fid, val in id_map.items() if any(d in val.lower() for d in domains_set)]
+                if target_identity_ids:
+                    # Mark messages as deleted in Gloda
+                    encoded_email = urllib.parse.quote(email_addr)
+                    folder_rows = c.execute('SELECT id FROM folderLocations WHERE folderURI LIKE ? OR folderURI LIKE ?', 
+                                            ('%' + encoded_email + '%', '%' + email_addr + '%')).fetchall()
+                    if folder_rows:
+                        fids = [r[0] for r in folder_rows]
+                        placeholders = ','.join('?' for _ in fids)
+                        for tid in target_identity_ids:
+                            c.execute(f"UPDATE messages SET deleted = 1 WHERE folderID IN ({placeholders}) AND jsonAttributes LIKE ?", 
+                                      fids + [f'%"{tid}"%'])
+                    conn.commit()
+                conn.close()
+            except Exception as ge:
+                log_event("DELETE", f"Gloda database update warning: {ge}", level="WARNING")
 
         log_event("DELETE", f"COMPLETED: Deleted {deleted_count} messages across Thunderbird storage.", level="SUCCESS")
         return {"success": True, "deleted_domains": len(domains), "deleted_count": deleted_count}
