@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+accounts_config.json
+*.bak
+.DS_Store
+Thumbs.db
+*.log
+scratch/
+EmailCleaner_Desktop_Suite.zip

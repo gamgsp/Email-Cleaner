@@ -1,0 +1,98 @@
+================================================================================
+       EMAIL CLEANING & AUTO-UNSUBSCRIBER SUITE FOR WINDOWS (OUTLOOK & IMAP)
+================================================================================
+
+This suite contains two desktop web applications for Windows:
+
+  1. MailSweep  (Email Cleaner — Outlook & IMAP Edition)
+     Scans mailboxes, groups messages by domain into 9 intelligent
+     categories, and safely deletes unwanted promotional, ad, or spam emails.
+     Default Port: http://localhost:7890
+
+  2. UnsubBot   (Automated Email Unsubscriber — Outlook & IMAP Edition)
+     Scans emails for RFC 8058 One-Click headers, RFC 2369 links, and web
+     unsubscribe forms, then executes unsubscription with live terminal logging.
+     Default Port: http://localhost:7891
+
+================================================================================
+1. OUTLOOK ACCOUNT SETUP & THE "NEW OUTLOOK FOR WINDOWS" NOTICE
+================================================================================
+
+On Windows 10 & 11, there are two versions of Microsoft Outlook:
+
+  A. CLASSIC OUTLOOK FOR DESKTOP (OUTLOOK.EXE):
+     - Part of Microsoft 365, Office 2021/2019/2016 desktop suite.
+     - Supports COM MAPI automation. Accounts populate automatically on launch.
+
+  B. NEW OUTLOOK FOR WINDOWS (olk.exe) & WEBMAIL:
+     - The default pre-installed modern app in Windows 11.
+     - Microsoft designed "New Outlook" as a web-based app (WebView2) that does
+       NOT expose COM automation ("Invalid class string" error).
+     - SOLUTION: Click "+ Add Account / Manage Accounts" in the web UI to connect
+       via Universal IMAP mode in 30 seconds!
+
+  UNIVERSAL IMAP MODE (WORKS WITH ANY EMAIL PROVIDER):
+     - Works with Microsoft Outlook.com / Hotmail / Office 365:
+         Host: outlook.office365.com, Port: 993, SSL: checked
+     - Works with Google Gmail:
+         Host: imap.gmail.com, Port: 993, SSL: checked
+     - Works with Yahoo Mail:
+         Host: imap.mail.yahoo.com, Port: 993, SSL: checked
+     - Works with Apple iCloud:
+         Host: imap.mail.me.com, Port: 993, SSL: checked
+     - Note: For accounts with 2-Factor Authentication, use an "App Password"
+       generated in your email provider's security settings.
+     - Accounts are saved locally in accounts_config.json and load automatically.
+
+================================================================================
+2. LIVE TERMINAL LOGGING & HOW TO VERIFY JOBS ARE PROCESSED
+================================================================================
+
+Both applications now feature real-time console logging with timestamps and icons:
+
+  - IN UNSUBBOT:
+    The terminal displays step-by-step unsubscription attempts:
+      [2026-10-11 06:00:25] 🔕 [UNSUB] [1/5] Processing: domain.com (<sender>)
+      [2026-10-11 06:00:25] ⚡ [RFC] Attempting Phase 1: RFC 8058 One-Click POST...
+      [2026-10-11 06:00:26] ⚡ [RFC] Server response HTTP 200 OK
+      [2026-10-11 06:00:26] ✅ [UNSUB] [SUCCESS] RFC 8058 One-Click succeeded!
+    If a newsletter requires login or CAPTCHA:
+      [2026-10-11 06:00:30] ⚠️ Manual action needed: Page requires CAPTCHA at <url>
+    The web UI will display an "[Open Link ↗]" button allowing you to open
+    the exact unsubscribe page in 1 click!
+
+  - IN MAILSWEEP:
+    The terminal logs every domain matched and deleted:
+      [2026-10-11 06:00:10] 🗑️ [DELETE] DELETION REQUEST: Account: 'Personal'
+      [2026-10-11 06:00:12] 🗑️ [DELETE] Deleted #1: [spammer.com] '50% off deals'
+      [2026-10-11 06:00:15] ✅ [DELETE] COMPLETED: Deleted 48 messages. Remaining: 1,372
+
+================================================================================
+3. PREREQUISITES & INSTALLATION
+================================================================================
+
+1. Python 3:
+   - Python 3.8 or newer must be installed on Windows.
+   - The launcher automatically detects `py` launcher or `python.exe`.
+   - Verify Python: `py --version` or `python --version`
+
+2. Python Libraries:
+   - In Command Prompt / PowerShell, install dependencies:
+       pip install pywin32 requests beautifulsoup4
+     OR using `py`:
+       py -m pip install -r requirements.txt
+
+================================================================================
+4. HOW TO RUN
+================================================================================
+
+METHOD A: ONE-CLICK LAUNCHER
+   - Double-click "start_windows_suite.bat" in this folder or in the root folder.
+   - Choose:
+       1) Launch MailSweep Cleaner (Port 7890)
+       2) Launch UnsubBot Unsubscriber (Port 7891)
+       3) Launch Both Applications (Opens separate terminal windows with live logs)
+
+METHOD B: LAUNCH INDIVIDUAL APPS
+   - MailSweep: double-click MailSweep\run_cleaner.bat
+   - UnsubBot:  double-click UnsubBot\run_unsubscriber.bat
