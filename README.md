@@ -187,14 +187,14 @@ Email Cleaner is proudly engineered and maintained under the digital infrastruct
     </tr>
     <tr>
       <td align="center">
-        <a href="https://exchange.gspcoin.us" target="_blank">
+        <a href="https://gspcexchange.com" target="_blank">
           <img src="https://github.com/gamgsp/globaldata/blob/main/GSPC%20Exchange/gspcexc-dark-logo.png?raw=true" alt="GSPC Exchange" width="140" /><br />
           <strong>GSPC Exchange</strong>
         </a>
       </td>
       <td><strong>DeFi & P2P Trading</strong></td>
       <td>
-        <strong>Website:</strong> <a href="https://exchange.gspcoin.us" target="_blank">exchange.gspcoin.us</a><br />
+        <strong>Website:</strong> <a href="https://gspcexchange.com" target="_blank">gspcexchange.com</a><br />
         A secure, non-custodial P2P cryptocurrency escrow exchange featuring automated order matching, multi-chain settlement, and zero middleman risk.
       </td>
     </tr>
